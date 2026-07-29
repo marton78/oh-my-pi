@@ -1126,8 +1126,11 @@ function safeJsonStringify(value: unknown): string | undefined {
  */
 function fenceCodeBlock(text: string): string {
 	let fence = "```";
-	for (const match of text.matchAll(/^```+/gm)) {
-		while (match[0].length >= fence.length) fence += "`";
+	// A closing fence may be indented up to three spaces (CommonMark), so an
+	// indented run of backticks closes the block just as a flush one does.
+	for (const match of text.matchAll(/^ {0,3}`{3,}/gm)) {
+		const run = match[0].trimStart();
+		while (run.length >= fence.length) fence += "`";
 	}
 	return `${fence}\n${text}\n${fence}`;
 }
