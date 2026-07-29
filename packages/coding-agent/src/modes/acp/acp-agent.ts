@@ -2242,6 +2242,10 @@ export class AcpAgent implements Agent {
 			cwd,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
 			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
+			// Persisted `details.terminalId`s name terminals from the connection that
+			// ran the command. This client never created them and cannot resolve
+			// them, so replayed commands must render their recorded output as text.
+			isTerminalLive: () => false,
 		});
 		if (options.includeStart === false) {
 			return notifications;

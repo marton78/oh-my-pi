@@ -29,6 +29,14 @@ interface AcpEventMapperOptions {
 	 * before emitting `ToolCallLocation` entries.
 	 */
 	cwd?: string;
+	/**
+	 * Whether `terminalId` names a terminal the connected client created on this
+	 * connection. Ids restored from a persisted transcript (`session/load`
+	 * replay) belong to a previous process's terminals, which the client cannot
+	 * render, so those tool calls fall back to emitting the recorded output as
+	 * text. Defaults to treating every id as live.
+	 */
+	isTerminalLive?: (terminalId: string) => boolean;
 }
 
 interface ContentArrayContainer {
@@ -740,7 +748,7 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 	const detailsImageContent = extractDetailsImageToolCallContent(value, options, richContent);
 	const combinedContent = [...richContent, ...detailsImageContent];
 	const terminalId = extractTerminalId(value);
-	if (terminalId) {
+	if (terminalId && (options.isTerminalLive?.(terminalId) ?? true)) {
 		// A live terminal already renders the command and its output as code;
 		// duplicating that as plain-text content gets markdown-rendered (`#`
 		// lines read as headings) and hides the terminal's own collapse control
