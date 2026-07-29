@@ -243,7 +243,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "tool_execution_update": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
-			const codeFence = isCommandToolName(event.toolName) || event.toolName === "eval";
+			const codeFence = shouldCodeFenceToolOutput(event.toolName);
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, event.args),
 				extractToolCallContent(event.partialResult, options, codeFence),
@@ -266,7 +266,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
-			const codeFence = isCommandToolName(event.toolName) || event.toolName === "eval";
+			const codeFence = shouldCodeFenceToolOutput(event.toolName);
 			const resultContent = [
 				...extractDiffToolCallContent(event.result),
 				...extractToolCallContent(event.result, options, codeFence),
@@ -643,6 +643,32 @@ function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: 
 
 function isCommandToolName(toolName: string): boolean {
 	return toolName === "bash" || toolName === "shell" || toolName === "exec";
+}
+
+/**
+ * Whether a tool's output content should render as a fenced code block
+ * rather than raw Markdown. Applies to command/eval output (handled by
+ * their own title/terminal paths) and to tools whose output is code or
+ * file/search data — a file's contents, a diff notice, a search hit list —
+ * never natural-language prose. Deliberately excludes tools whose output is
+ * meant to render as rich Markdown (subagent/task reports, web search hits,
+ * Hub messages): fencing those would flatten formatting the tool intends.
+ */
+function shouldCodeFenceToolOutput(toolName: string): boolean {
+	if (isCommandToolName(toolName) || toolName === "eval") return true;
+	switch (toolName) {
+		case "read":
+		case "write":
+		case "edit":
+		case "delete":
+		case "move":
+		case "grep":
+		case "glob":
+		case "ast_grep":
+			return true;
+		default:
+			return false;
+	}
 }
 
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
