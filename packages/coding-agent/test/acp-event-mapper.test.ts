@@ -831,6 +831,28 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
+	it("renders recorded output as text when the terminal id is not live", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-stale",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "done" }],
+					details: { terminalId: "term-replay" },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ isTerminalLive: () => false },
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as { content?: unknown };
+		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "```\ndone\n```" } }]);
+	});
+
 	it("fences plain command output visible without terminal details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -1028,7 +1050,10 @@ describe("ACP event mapper", () => {
 			expect(toolCall?.rawInput).toEqual({ command: "echo hi" });
 			expect(toolCall?.rawInput).not.toEqual({ input: { command: "echo hi" } });
 			expect(toolCall?.content).toBeUndefined();
-			expect(finalUpdate?.content).toEqual([{ type: "terminal", terminalId: "term-replay" }]);
+			// The persisted terminal id belongs to the connection that ran the
+			// command, so replay shows the recorded output instead of a terminal
+			// widget this client cannot resolve.
+			expect(finalUpdate?.content).toEqual([{ type: "content", content: { type: "text", text: "```\ndone\n```" } }]);
 		} finally {
 			abortController.abort();
 			await fs.promises.rm(root, { recursive: true, force: true });
