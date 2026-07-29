@@ -797,6 +797,40 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
+	it("surfaces detail notices the live terminal cannot show", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-notices",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "boom\n\nCommand exited with code 1" }],
+					details: {
+						terminalId: "term-1",
+						exitCode: 1,
+						notices: ["Command exited with code 1", "[raw output: artifact://7]"],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as { content?: unknown };
+		// The terminal shows the process byte stream; the truncation/artifact
+		// pointer and exit code are synthesized after it and would be lost with
+		// the raw-output text block.
+		expect(update.content).toEqual([
+			{ type: "terminal", terminalId: "term-1" },
+			{
+				type: "content",
+				content: { type: "text", text: "Command exited with code 1\n[raw output: artifact://7]" },
+			},
+		]);
+	});
+
 	it("fences plain command output visible without terminal details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{

@@ -22,7 +22,13 @@ import type {
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
-import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import {
+	DEFAULT_MAX_BYTES,
+	enforceInlineByteCap,
+	formatRawOutputArtifactNotice,
+	streamTailUpdates,
+	TailBuffer,
+} from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
@@ -284,6 +290,14 @@ export interface BashToolDetails {
 	/** True when the command was killed by its timeout deadline (not a failure). */
 	timedOut?: boolean;
 	terminalId?: string;
+	/**
+	 * Agent-synthesized notes appended after the raw output (wall time,
+	 * `(output truncated)`, exit code, `[raw output: artifact://N]`). A renderer
+	 * that shows the raw stream some other way — an ACP client-bridge terminal
+	 * replaces the inline text entirely — surfaces these separately so the exit
+	 * code and the artifact pointer survive.
+	 */
+	notices?: readonly string[];
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -617,6 +631,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const failedExit = exitCode !== undefined && exitCode !== 0;
 
 		const outputLines = [this.#formatResultOutput(result)];
+		// Every notice appended below is mirrored into `details.notices`: they are
+		// agent-synthesized, absent from the process byte stream, and would be lost
+		// by a renderer that replaces the inline text with a live terminal widget.
 		const notices: string[] = [];
 		if (options.wallTimeMs !== undefined) {
 			notices.push(formatWallTimeNotice(options.wallTimeMs));
@@ -627,7 +644,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			}
 		}
 		if (notices.length > 0) outputLines.push("", ...notices);
-		if (failedExit) outputLines.push("", formatExitCodeNotice(exitCode));
+		if (failedExit) {
+			const exitNotice = formatExitCodeNotice(exitCode);
+			notices.push(exitNotice);
+			outputLines.push("", exitNotice);
+		}
 		const outputText = outputLines.join("\n");
 
 		// Timeouts are not failures — the command ran its course. Return an error
@@ -663,9 +684,13 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// sink spilled, its artifact already holds the full raw stream — reuse
 		// that id instead of saving a second (already-truncated) copy, so the
 		// `[raw output: artifact://N]` footer and the truncation notice agree.
+		let spilledArtifactId: string | undefined;
 		const inlineCap = {
 			maxBytes: resolveInlineByteCapBudget(this.session.settings),
-			saveArtifact: (full: string) => result.artifactId ?? saveBashOriginalArtifact(this.session, full),
+			saveArtifact: async (full: string) => {
+				spilledArtifactId = result.artifactId ?? (await saveBashOriginalArtifact(this.session, full));
+				return spilledArtifactId;
+			},
 		};
 
 		if (isTimeout) {
@@ -676,8 +701,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			// has not, so provide the LLM-facing annotation exactly once.
 			if (!normalizeResultOutput(result).startsWith(`[${message}]\n`)) {
 				outputLines.push("", `[${message}]`);
+				notices.push(`[${message}]`);
 			}
 			const timeoutOutputText = await enforceInlineByteCap(outputLines.join("\n"), inlineCap);
+			if (spilledArtifactId) notices.push(formatRawOutputArtifactNotice(spilledArtifactId));
+			if (notices.length > 0) details.notices = notices;
 			return toolResult(details)
 				.text(timeoutOutputText)
 				.truncationFromSummary(result, { direction: "tail" })
@@ -690,6 +718,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		// No-op for already-bounded output; see `inlineCap` above.
 		const cappedOutputText = await enforceInlineByteCap(outputText, inlineCap);
+		if (spilledArtifactId) notices.push(formatRawOutputArtifactNotice(spilledArtifactId));
+		if (notices.length > 0) details.notices = notices;
 
 		const resultBuilder = toolResult(details)
 			.text(cappedOutputText)

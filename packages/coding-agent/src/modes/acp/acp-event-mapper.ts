@@ -51,6 +51,10 @@ interface TerminalIdContainer {
 	terminalId?: unknown;
 }
 
+interface NoticesContainer {
+	notices?: unknown;
+}
+
 interface BinaryLikeContent extends TypedValue {
 	data?: unknown;
 	mimeType?: unknown;
@@ -741,14 +745,17 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 		// duplicating that as plain-text content gets markdown-rendered (`#`
 		// lines read as headings) and hides the terminal's own collapse control
 		// behind a redundant card. Keep non-text content (e.g. images) since
-		// that isn't otherwise represented in the terminal. A framework-level
-		// `errorMessage`/`message` note (e.g. "Permission request cancelled")
-		// isn't part of the raw command output the terminal shows, so it still
-		// surfaces here, unfenced.
+		// that isn't otherwise represented in the terminal. What the terminal
+		// cannot show still surfaces here, unfenced: `details.notices` (exit
+		// code, truncation marker, `[raw output: artifact://N]` pointer) and a
+		// framework-level `errorMessage`/`message` note (e.g. "Permission
+		// request cancelled") are not part of the raw command output.
 		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
-		const content = hasTerminalContent(nonTextContent, terminalId)
+		const withTerminal = hasTerminalContent(nonTextContent, terminalId)
 			? nonTextContent
 			: [...nonTextContent, terminalToolCallContent(terminalId)];
+		const notices = extractDetailsNotices(value);
+		const content = notices ? [...withTerminal, textToolCallContent(notices)] : withTerminal;
 		const directText = extractDirectText(value);
 		if (!directText || hasEquivalentTextContent(content, directText)) {
 			return content;
@@ -991,6 +998,22 @@ function hasEquivalentTextContent(content: ToolCallContent[], text: string): boo
 
 function hasTerminalContent(content: ToolCallContent[], terminalId: string): boolean {
 	return content.some(item => item.type === "terminal" && item.terminalId === terminalId);
+}
+
+/**
+ * `details.notices`: notes a tool appended after its raw output (exit code,
+ * wall time, truncation marker, `[raw output: artifact://N]` pointer). A client
+ * terminal renders only the process byte stream, so these have to be re-emitted
+ * beside it or they go out with the raw-output text block.
+ */
+function extractDetailsNotices(value: unknown): string | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const details = (value as DetailsContainer).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const notices = (details as NoticesContainer).notices;
+	if (!Array.isArray(notices)) return undefined;
+	const lines = notices.filter((notice): notice is string => typeof notice === "string" && notice.length > 0);
+	return lines.length > 0 ? normalizeText(lines.join("\n")) : undefined;
 }
 
 /**
