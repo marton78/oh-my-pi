@@ -316,7 +316,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				update._meta = {
 					terminal_output: {
 						terminal_id: event.toolCallId,
-						data: extractReadableText(event.result) ?? "",
+						data: buildTerminalMetaOutputData(event.toolName, args, extractReadableText(event.result) ?? ""),
 					},
 					terminal_exit: {
 						terminal_id: event.toolCallId,
@@ -660,6 +660,54 @@ function buildEvalStartText(args: unknown): string | undefined {
 		lines.push(title ? `[${language}] ${title}` : `[${language}]`, code);
 	}
 	return lines.length > 0 ? limitText(lines.join("\n")) : undefined;
+}
+
+/**
+ * Just the source code for one or more eval cells, without
+ * `buildEvalStartText`'s `[lang] title` label line — that label is already
+ * the tool call's own title/header (see `buildEvalTitle`), so repeating it
+ * here would show it twice in a client that echoes this text.
+ */
+function buildEvalCodeText(args: unknown): string | undefined {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		return undefined;
+	}
+	const container = args as EvalCellContainer & EvalCellLike;
+	const cells = Array.isArray(container.cells)
+		? container.cells
+		: typeof container.code === "string"
+			? [container]
+			: [];
+	const codeBlocks: string[] = [];
+	for (const cell of cells) {
+		if (typeof cell !== "object" || cell === null || Array.isArray(cell)) {
+			continue;
+		}
+		const code = extractStringProperty<EvalCellLike>(cell, "code");
+		if (code) codeBlocks.push(code);
+	}
+	return codeBlocks.length > 0 ? limitText(codeBlocks.join("\n\n")) : undefined;
+}
+
+/**
+ * The final `terminal_output` payload for a meta-terminal tool call.
+ * Zed's `render_any_tool_call` routes any tool call carrying a `terminal`
+ * content item exclusively through its terminal renderer (see
+ * `has_terminals` in `thread_view.rs`) — every other `content` item on the
+ * same tool call is silently ignored, never shown "hidden until expanded"
+ * as `buildEvalStartText`'s doc comment once assumed. `bash`/`shell`/`exec`
+ * need no workaround: their title *is* the full command already. But
+ * `eval`'s title is deliberately a short `[lang] cellTitle` label (see
+ * `buildEvalTitle`), so its source has nowhere else to render — the only
+ * remaining place is inside the terminal's own text stream, echoed ahead of
+ * the real output like a shell echoing the command it's about to run.
+ */
+function buildTerminalMetaOutputData(toolName: string, args: unknown, output: string): string {
+	if (toolName !== "eval") {
+		return output;
+	}
+	const code = buildEvalCodeText(args);
+	return code ? `${code}\n${"─".repeat(48)}\n${output}` : output;
 }
 
 /**

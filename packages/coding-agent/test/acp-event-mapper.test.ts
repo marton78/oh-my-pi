@@ -1037,7 +1037,7 @@ describe("ACP event mapper", () => {
 				result: { content: [{ type: "text", text: "hi" }], details: {} },
 			} as AgentSessionEvent,
 			"session-1",
-			{ terminalMetaCapable: true },
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", title: "hello", code: "print('hi')" }) },
 		);
 		expect(endUpdates).toHaveLength(1);
 		expectAcpNotifications(endUpdates);
@@ -1046,8 +1046,13 @@ describe("ACP event mapper", () => {
 			_meta?: Record<string, unknown>;
 		};
 		expect(end.content).toEqual([{ type: "terminal", terminalId: "tc-eval-meta" }]);
+		// Zed routes any tool call carrying a `terminal` content item exclusively
+		// through its terminal renderer — a separate text content item alongside
+		// it is never shown. The only place eval's source (hidden behind a short
+		// `[lang] title` header, unlike bash's full-command title) can render is
+		// inside the terminal's own text stream, echoed ahead of the real output.
 		expect(end._meta).toEqual({
-			terminal_output: { terminal_id: "tc-eval-meta", data: "hi" },
+			terminal_output: { terminal_id: "tc-eval-meta", data: `print('hi')\n${"─".repeat(48)}\nhi` },
 			terminal_exit: { terminal_id: "tc-eval-meta", exit_code: 0, signal: null },
 		});
 	});
