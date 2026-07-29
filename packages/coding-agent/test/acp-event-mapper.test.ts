@@ -397,7 +397,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.title).toBe("[js] sum\nreturn 1 + 1;");
+		expect(update.title).toBe("[js] sum");
 		expect(update.kind).toBe("execute");
 		expect(update.status).toBe("pending");
 		expect(update.rawInput).toEqual({ language: "js", title: "sum", code: "return 1 + 1;" });
@@ -427,11 +427,11 @@ describe("ACP event mapper", () => {
 			title: string;
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
-		expect(update.title).toBe("[?]\nx\n[py]\ny");
+		expect(update.title).toBe("[?], [py]");
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "[?]\nx\n[py]\ny" } }]);
 	});
 
-	it("limits eval source before emitting visible tool-call text", () => {
+	it("limits eval source before emitting visible tool-call content, keeping the title short", () => {
 		const source = "x".repeat(4_100);
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -449,9 +449,12 @@ describe("ACP event mapper", () => {
 			title: string;
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
-		expect(update.title).toHaveLength(4_000);
-		expect(update.title.endsWith("…")).toBe(true);
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: update.title } }]);
+		// The title has no cell title to draw on, so it stays a short language
+		// tag — the huge code body lives only in the (collapsible) content.
+		expect(update.title).toBe("[js]");
+		const contentText = update.content?.[0]?.content?.text;
+		expect(contentText).toHaveLength(4_000);
+		expect(contentText?.endsWith("…")).toBe(true);
 	});
 	it("emits a diff ToolCallContent for each per-file edit result", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
