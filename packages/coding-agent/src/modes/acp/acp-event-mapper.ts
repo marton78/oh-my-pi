@@ -585,6 +585,44 @@ function buildEvalStartText(args: unknown): string | undefined {
 	return lines.length > 0 ? limitText(lines.join("\n")) : undefined;
 }
 
+/**
+ * Short label for the tool call's title/header, which a live-terminal-style
+ * ACP client (Zed) renders unconditionally, never gated behind the
+ * expand/collapse disclosure. Unlike `buildEvalStartText` (used for the
+ * *content*, which the client does hide until expanded), this must stay
+ * short: language + optional cell title, never the code itself — otherwise
+ * the "hidden until expanded" code shows up twice, once unhideable as the
+ * title.
+ */
+function buildEvalTitle(args: unknown): string | undefined {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		return undefined;
+	}
+	const container = args as EvalCellContainer & EvalCellLike;
+	const cells = Array.isArray(container.cells)
+		? container.cells
+		: typeof container.code === "string"
+			? [container]
+			: [];
+	if (cells.length === 0) {
+		return undefined;
+	}
+	const labels: string[] = [];
+	for (const cell of cells) {
+		if (typeof cell !== "object" || cell === null || Array.isArray(cell)) {
+			continue;
+		}
+		const language = extractStringProperty<EvalCellLike>(cell, "language") ?? "?";
+		const title = extractStringProperty<EvalCellLike>(cell, "title");
+		const code = extractStringProperty<EvalCellLike>(cell, "code");
+		if (!code) {
+			continue;
+		}
+		labels.push(title ? `[${language}] ${title}` : `[${language}]`);
+	}
+	return labels.length > 0 ? limitText(labels.join(", ")) : undefined;
+}
+
 function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: ToolCallContent[]): ToolCallContent[] {
 	if (startContent.length === 0) {
 		return resultContent;
@@ -613,8 +651,8 @@ function buildToolTitle(toolName: string, args: unknown, intent: string | undefi
 		if (command) return limitText(command);
 	}
 	if (toolName === "eval") {
-		const evalText = buildEvalStartText(args);
-		if (evalText) return evalText;
+		const evalTitle = buildEvalTitle(args);
+		if (evalTitle) return evalTitle;
 	}
 	const trimmedIntent = intent?.trim();
 	if (trimmedIntent) {
