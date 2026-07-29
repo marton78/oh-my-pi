@@ -743,6 +743,36 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("widens the fence past backtick runs the output already contains", () => {
+		const fenceUpdates = (output: string) =>
+			mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: "tc-fence-widen",
+					toolName: "bash",
+					isError: false,
+					result: output,
+				} as AgentSessionEvent,
+				"session-1",
+			);
+
+		const flush = fenceUpdates("```\nfenced\n```");
+		// A closing fence indented up to three spaces closes the block too, so it
+		// has to widen the wrapper the same way a flush run does.
+		const indented = fenceUpdates("diff --git a/R.md b/R.md\n ```\n-a\n+b");
+
+		expectAcpNotifications([...flush, ...indented]);
+		expect((flush[0]!.update as { content?: unknown }).content).toEqual([
+			{ type: "content", content: { type: "text", text: "````\n```\nfenced\n```\n````" } },
+		]);
+		expect((indented[0]!.update as { content?: unknown }).content).toEqual([
+			{
+				type: "content",
+				content: { type: "text", text: "````\ndiff --git a/R.md b/R.md\n ```\n-a\n+b\n````" },
+			},
+		]);
+	});
+
 	it("fences plain command output visible without terminal details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
