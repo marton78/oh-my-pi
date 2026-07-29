@@ -136,6 +136,9 @@ class FakeAgentSession {
 	async refreshSkills(): Promise<void> {
 		this.refreshSkillsCalls++;
 	}
+	buildTranscriptSessionContext(options?: { keepDanglingToolCalls?: boolean; collapseCompactedHistory?: boolean }) {
+		return this.sessionManager.buildSessionContext({ transcript: true, ...options });
+	}
 	planModeState: PlanModeState | undefined;
 	waitForIdleCalls = 0;
 	waitForIdleBlocker: (() => Promise<void>) | undefined;

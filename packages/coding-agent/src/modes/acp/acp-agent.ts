@@ -2042,7 +2042,17 @@ export class AcpAgent implements Agent {
 		const cwd = record.session.sessionManager.getCwd();
 		const replayedToolCallIds = new Set<string>();
 		const replayedToolCallArgs = new Map<string, unknown>();
-		for (const message of record.session.sessionManager.buildSessionContext().messages as ReplayableMessage[]) {
+		// `buildSessionContext()` (the default) builds the *LLM* context: it
+		// collapses pre-compaction history behind a summary and silently strips
+		// tool calls left dangling by an interrupted/killed process (no
+		// persisted result yet) — exactly wrong for reconstructing what a human
+		// should see on `session/load`. `buildTranscriptSessionContext` is the
+		// dedicated full-fidelity display builder (the same one `--resume`'s
+		// initial TUI redraw uses): every entry in chronological order,
+		// compactions inline, and `keepDanglingToolCalls` keeps a still-running
+		// call visible as pending instead of erasing the box entirely.
+		const context = record.session.buildTranscriptSessionContext({ keepDanglingToolCalls: true });
+		for (const message of context.messages as ReplayableMessage[]) {
 			for (const notification of this.#messageToReplayNotifications(
 				record.session.sessionId,
 				message,
