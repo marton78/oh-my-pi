@@ -238,6 +238,7 @@ Test the contract the system exposes — not the easiest internal detail to asse
 - **Never source-grep.** A test that reads an implementation file (`.ts`/`.rs`/build script) and asserts on its *text* — `expect(src).toContain("someCall()")`, `.toMatch(/import .../)`, `.not.toContain("oldName")`, or "comment must say X" — is banned. It tests how code *looks*, not what it *does*: it breaks on harmless refactors (comment reflow, rename, import reorder) and passes while the behavior is broken. Assert the observable contract instead (run the code, check output/state/error), use the runtime smoke probe for wiring you cannot exercise in-process, and enforce structural invariants (no value-import of X, no self-import) with a type test or a lint/biome rule — never a string scan of the source. (Reading a file your code *wrote* — apply-patch result, generated bundle, temp fixture — and asserting on that output is fine; that is behavior, not a source grep.)
 - Don't add tests for tiny low-risk changes unless they protect a real contract or fix a regression-prone edge case.
 - Prefer focused package-local verification for the changed area.
+- **ACP surface changes** (`modes/acp/`, `commands/acp.ts`, or anything reachable only through the real JSON-RPC handshake) MUST be smoke-tested with [`acp-probe`](https://github.com/marton78/acp-probe) in addition to `test/acp-*.test.ts`. See [`docs/acp-development.md`](docs/acp-development.md) for the full workflow — probe usage, the `claude-agent-acp` reference implementation, and common pitfalls.
 
 ## Changelog
 
