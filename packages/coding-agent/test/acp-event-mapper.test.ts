@@ -593,6 +593,65 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("does not duplicate a succeeded file's diff with its own ack text when a later file in the same edit fails", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-edit-partial-fail-multi-success",
+				toolName: "edit",
+				isError: true,
+				result: {
+					// Mirrors `executeApplyPatchPerFile`'s real joined text: every
+					// succeeded file's own ack line, followed by the failure.
+					content: [
+						{
+							type: "text",
+							text: "Updated foo.ts\nUpdated bar.ts\nError editing skipped.ts: boom\nFiles already applied: foo.ts, bar.ts.",
+						},
+					],
+					details: {
+						perFileResults: [
+							{ path: "foo.ts", diff: "...", oldText: "before-foo\n", newText: "after-foo\n" },
+							{ path: "bar.ts", diff: "...", oldText: "before-bar\n", newText: "after-bar\n" },
+							{ path: "skipped.ts", diff: "", isError: true, errorText: "boom" },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		expect(update.content).toContainEqual({
+			type: "diff",
+			path: "foo.ts",
+			oldText: "before-foo\n",
+			newText: "after-foo\n",
+		});
+		expect(update.content).toContainEqual({
+			type: "diff",
+			path: "bar.ts",
+			oldText: "before-bar\n",
+			newText: "after-bar\n",
+		});
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe("```\nError editing skipped.ts: boom\n```");
+		// Neither succeeded file's own ack line should reappear alongside its diff.
+		expect(textBlocks[0]?.content?.text).not.toContain("Updated foo.ts");
+		expect(textBlocks[0]?.content?.text).not.toContain("Updated bar.ts");
+	});
+
 	it("includes the target file in the edit tool's title for every edit mode", () => {
 		const pathStart = mapAgentSessionEventToAcpSessionUpdates(
 			{

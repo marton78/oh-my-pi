@@ -332,10 +332,23 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// it as a near-duplicate block below the diff. Only add that echo back
 				// when there's no diff, or the call partially failed — a per-file error
 				// message isn't represented by any diff and would otherwise be lost.
-				const resultContent =
-					diffContent.length > 0 && !event.isError
-						? diffContent
-						: [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
+				//
+				// A partial failure's joined text echo still carries every succeeded
+				// file's own ack line (e.g. "Updated foo.ts") alongside the failure —
+				// re-adding all of it here would duplicate those already-diffed files'
+				// content. Use only the per-file error text in that case instead of the
+				// full joined echo.
+				let resultContent: ToolCallContent[];
+				if (diffContent.length > 0 && !event.isError) {
+					resultContent = diffContent;
+				} else if (diffContent.length > 0 && event.isError) {
+					const failureText = extractEditFailureText(event.result);
+					resultContent = failureText
+						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(failureText) : failureText)]
+						: diffContent;
+				} else {
+					resultContent = [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
+				}
 				const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 				if (content.length > 0) {
 					update.content = content;
@@ -949,6 +962,34 @@ function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
 		if (block) blocks.push(block);
 	}
 	return blocks;
+}
+
+/** Join the per-file error messages from a partially-failed multi-file edit, skipping succeeded entries. */
+function extractEditFailureText(result: unknown): string | undefined {
+	if (typeof result !== "object" || result === null) return undefined;
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const perFile = (details as { perFileResults?: unknown }).perFileResults;
+	if (!Array.isArray(perFile)) return undefined;
+	const lines: string[] = [];
+	for (const entry of perFile) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const candidate = entry as {
+			path?: unknown;
+			isError?: unknown;
+			errorText?: unknown;
+			displayErrorText?: unknown;
+		};
+		if (candidate.isError !== true) continue;
+		const message =
+			(typeof candidate.displayErrorText === "string" && candidate.displayErrorText) ||
+			(typeof candidate.errorText === "string" && candidate.errorText) ||
+			undefined;
+		if (!message) continue;
+		const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
+		lines.push(path ? `Error editing ${path}: ${message}` : message);
+	}
+	return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 function buildDiffContent(entry: unknown): ToolCallContent | undefined {
