@@ -1116,6 +1116,52 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("streams cumulative output through the meta-terminal convention on tool_execution_update", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-eval-progress",
+				toolName: "eval",
+				args: { language: "py", title: "hello", code: "print('hi')" },
+				partialResult: { content: [{ type: "text", text: "hi\nmore" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true },
+		);
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			status?: string;
+			content?: unknown;
+			_meta?: Record<string, unknown>;
+		};
+		expect(update.status).toBe("in_progress");
+		// No incremental `content` story for a meta-terminal call (see
+		// `wantsMetaTerminal`'s doc) — the cumulative-so-far text instead lands in
+		// `_meta.terminal_output`, same shape `tool_execution_end` uses, so the
+		// terminal fills in live instead of staying blank until completion.
+		expect(update.content).toBeUndefined();
+		expect(update._meta).toEqual({
+			terminal_output: { terminal_id: "tc-eval-progress", data: `print('hi')\n${"─".repeat(48)}\nhi\nmore` },
+		});
+	});
+
+	it("emits no meta-terminal output on tool_execution_update when there is no partial output yet", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-eval-progress-empty",
+				toolName: "eval",
+				args: { language: "py", code: "print('hi')" },
+				partialResult: { content: [], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true },
+		);
+		const update = updates[0]!.update as { _meta?: unknown };
+		expect("_meta" in update).toBe(false);
+	});
+
 	it("never uses the meta-terminal convention when the client didn't advertise it", () => {
 		const start = mapAgentSessionEventToAcpSessionUpdates(
 			{

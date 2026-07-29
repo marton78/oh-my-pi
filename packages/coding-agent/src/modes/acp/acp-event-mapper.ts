@@ -276,10 +276,23 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				rawOutput: event.partialResult,
 			};
 			// A meta-terminal call already got its (empty) terminal reference on
-			// `tool_execution_start`; there is no incremental-append story for it
-			// (see `wantsMetaTerminal`'s doc), so an in-progress update carries no
-			// content — the terminal fills in at `tool_execution_end`.
-			if (!wantsMetaTerminal(event.toolName, options)) {
+			// `tool_execution_start`; `content` has no incremental-append story for
+			// it (see `wantsMetaTerminal`'s doc), but `partialResult` is the same
+			// cumulative-so-far text a live terminal would show (see
+			// `streamTailUpdates`/`eval.ts`'s `pushUpdate`), so mirror it into
+			// `_meta.terminal_output` instead of leaving the terminal blank until
+			// `tool_execution_end`.
+			if (wantsMetaTerminal(event.toolName, options)) {
+				const partialText = extractPartialTerminalText(event.partialResult);
+				if (partialText) {
+					update._meta = {
+						terminal_output: {
+							terminal_id: event.toolCallId,
+							data: buildTerminalMetaOutputData(event.toolName, event.args, partialText),
+						},
+					};
+				}
+			} else {
 				const codeFence = shouldCodeFenceToolOutput(event.toolName);
 				const content = mergeToolUpdateContent(
 					buildToolStartContent(event.toolName, event.args),
@@ -1300,6 +1313,23 @@ function extractDetailsNotices(value: unknown): string | undefined {
 	if (!Array.isArray(notices)) return undefined;
 	const lines = notices.filter((notice): notice is string => typeof notice === "string" && notice.length > 0);
 	return lines.length > 0 ? normalizeText(lines.join("\n")) : undefined;
+}
+
+/**
+ * The `content` array's text blocks, joined — nothing else. Unlike
+ * `extractReadableText`, this never falls back to serializing the whole value
+ * as JSON, so an empty/no-text partial result (e.g. before a command has
+ * printed anything) correctly yields `undefined` instead of a stringified
+ * `{content:[],details:{}}` blob landing in a terminal.
+ */
+function extractPartialTerminalText(value: unknown): string | undefined {
+	const blocks = getContentBlocks(value);
+	if (!blocks) return undefined;
+	const text = blocks
+		.map(block => extractStructuredText(block))
+		.filter((chunk): chunk is string => typeof chunk === "string" && chunk.length > 0)
+		.join("\n");
+	return text.length > 0 ? normalizeText(text) : undefined;
 }
 
 /**
