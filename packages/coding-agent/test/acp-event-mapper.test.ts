@@ -1116,6 +1116,39 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("keeps each cell's own [lang] title label in a multi-cell eval's meta-terminal source echo", () => {
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-multi-cell-meta",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: "1\n2" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			{
+				terminalMetaCapable: true,
+				getToolArgs: () => ({
+					cells: [
+						{ language: "py", title: "first", code: "print(1)" },
+						{ language: "js", title: "second", code: "console.log(2)" },
+					],
+				}),
+			},
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		// The title ("[py] first, [js] second") only lists the labels together;
+		// without a per-cell marker in the source echo itself, a reader can't
+		// tell which code produced which part of the (also concatenated) output.
+		expect(end._meta).toEqual({
+			terminal_output: {
+				terminal_id: "tc-eval-multi-cell-meta",
+				data: `[py] first\nprint(1)\n\n[js] second\nconsole.log(2)\n${"─".repeat(48)}\n1\n2`,
+			},
+			terminal_exit: { terminal_id: "tc-eval-multi-cell-meta", exit_code: 0, signal: null },
+		});
+	});
+
 	it("streams cumulative output through the meta-terminal convention on tool_execution_update", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{

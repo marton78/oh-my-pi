@@ -689,10 +689,14 @@ function buildEvalStartText(args: unknown): string | undefined {
 }
 
 /**
- * Just the source code for one or more eval cells, without
+ * The source code for one or more eval cells. For a single cell, this omits
  * `buildEvalStartText`'s `[lang] title` label line — that label is already
  * the tool call's own title/header (see `buildEvalTitle`), so repeating it
- * here would show it twice in a client that echoes this text.
+ * here would show it twice in a client that echoes this text. For multiple
+ * cells, `buildEvalTitle` only lists the labels joined together
+ * (`"[py] a, [js] b"`), which doesn't say which code block is which once
+ * they're concatenated below — so each cell's own `[lang] title` line is
+ * kept here to preserve that attribution.
  */
 function buildEvalCodeText(args: unknown): string | undefined {
 	if (typeof args !== "object" || args === null || Array.isArray(args)) {
@@ -704,15 +708,29 @@ function buildEvalCodeText(args: unknown): string | undefined {
 		: typeof container.code === "string"
 			? [container]
 			: [];
-	const codeBlocks: string[] = [];
+	const entries: { language: string; title: string | undefined; code: string }[] = [];
 	for (const cell of cells) {
 		if (typeof cell !== "object" || cell === null || Array.isArray(cell)) {
 			continue;
 		}
 		const code = extractStringProperty<EvalCellLike>(cell, "code");
-		if (code) codeBlocks.push(code);
+		if (!code) continue;
+		entries.push({
+			language: extractStringProperty<EvalCellLike>(cell, "language") ?? "?",
+			title: extractStringProperty<EvalCellLike>(cell, "title"),
+			code,
+		});
 	}
-	return codeBlocks.length > 0 ? limitText(codeBlocks.join("\n\n")) : undefined;
+	if (entries.length === 0) {
+		return undefined;
+	}
+	const codeBlocks =
+		entries.length === 1
+			? [entries[0]!.code]
+			: entries.map(
+					entry => `${entry.title ? `[${entry.language}] ${entry.title}` : `[${entry.language}]`}\n${entry.code}`,
+				);
+	return limitText(codeBlocks.join("\n\n"));
 }
 
 /**
