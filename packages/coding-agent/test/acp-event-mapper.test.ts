@@ -977,6 +977,77 @@ describe("ACP event mapper", () => {
 		}
 	});
 
+	it("code-fences read/grep/write output but leaves web_search prose unfenced", () => {
+		const readUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-read-fence",
+				toolName: "read",
+				isError: false,
+				result: "1:# not a heading\n2:const x = 1;",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const grepUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-grep-fence",
+				toolName: "grep",
+				isError: false,
+				result: "# src/foo.ts\n*3: match here",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const writeUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-write-fence",
+				toolName: "write",
+				isError: false,
+				result: "Successfully wrote 12 bytes to foo.txt",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const webSearchUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-web-search-no-fence",
+				toolName: "web_search",
+				isError: false,
+				result: "# Top hit\nSome prose summary.",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expectAcpNotifications([...readUpdates, ...grepUpdates, ...writeUpdates, ...webSearchUpdates]);
+		const readUpdate = readUpdates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		const grepUpdate = grepUpdates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		const writeUpdate = writeUpdates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		const webSearchUpdate = webSearchUpdates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+
+		expect(readUpdate.content).toEqual([
+			{ type: "content", content: { type: "text", text: "```\n1:# not a heading\n2:const x = 1;\n```" } },
+		]);
+		expect(grepUpdate.content).toEqual([
+			{ type: "content", content: { type: "text", text: "```\n# src/foo.ts\n*3: match here\n```" } },
+		]);
+		expect(writeUpdate.content).toEqual([
+			{ type: "content", content: { type: "text", text: "```\nSuccessfully wrote 12 bytes to foo.txt\n```" } },
+		]);
+		// web_search results are meant to render as rich Markdown, not code.
+		expect(webSearchUpdate.content).toEqual([
+			{ type: "content", content: { type: "text", text: "# Top hit\nSome prose summary." } },
+		]);
+	});
+
 	it("replays assistant tool_use input through the ACP dispatcher without wrapping", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-replay-contract-"));
 		const cwd = path.join(root, "cwd");
