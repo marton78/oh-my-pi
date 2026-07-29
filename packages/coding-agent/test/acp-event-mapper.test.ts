@@ -773,6 +773,30 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
+	it("keeps a framework error note beside fenced output without a terminal", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-no-terminal-error",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "partial stdout" }],
+					errorMessage: "Permission request cancelled",
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as { content?: unknown };
+		expect(update.content).toEqual([
+			{ type: "content", content: { type: "text", text: "```\npartial stdout\n```" } },
+			{ type: "content", content: { type: "text", text: "Permission request cancelled" } },
+		]);
+	});
+
 	it("fences plain command output visible without terminal details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{

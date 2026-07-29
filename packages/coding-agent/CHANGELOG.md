@@ -113,6 +113,7 @@
 - Removed the dangling `MCPManager.setOnNotification` single-slot setter, which had no callers in the runtime. Replaced by `MCPManager.addNotificationListener` — multi-listener, per-listener error isolation, returns an unsubscribe function.
 ### Fixed
 
+- Fixed a framework-level `errorMessage`/`message` note (e.g. "Permission request cancelled") being dropped from an ACP tool call whose result also carried structured content blocks; it now surfaces beside them, unfenced, matching how the live-terminal path already treated it.
 - Fixed ACP command output escaping its Markdown code fence when the output itself contained a backtick run indented up to three spaces — CommonMark closes a fence there, so `git diff`/`cat` over a Markdown file had its tail re-rendered as prose. The fence now widens past indented runs, not just flush ones.
 
 ## [17.1.8] - 2026-07-28

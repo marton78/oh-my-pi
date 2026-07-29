@@ -761,7 +761,15 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 	// preserves it, `extractReadableText` trims it), so only fall back when
 	// structured extraction found no text at all.
 	if (combinedContent.some(item => item.type === "content" && item.content.type === "text")) {
-		return combinedContent;
+		// A framework-level `errorMessage`/`message` note is not one of those
+		// blocks, so it still surfaces beside them, unfenced — the same rule the
+		// terminal branch above follows.
+		const directText = extractDirectText(value);
+		const duplicate =
+			!directText ||
+			hasEquivalentTextContent(combinedContent, directText) ||
+			(codeFence && hasEquivalentTextContent(combinedContent, fenceCodeBlock(directText)));
+		return duplicate ? combinedContent : [...combinedContent, textToolCallContent(directText)];
 	}
 	const fallbackText = extractReadableText(value);
 	if (!fallbackText) {
