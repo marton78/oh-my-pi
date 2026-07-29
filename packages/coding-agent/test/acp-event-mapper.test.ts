@@ -103,6 +103,10 @@ class ReplayTestSession {
 	}
 
 	async refreshMCPTools(_tools: unknown): Promise<void> {}
+
+	buildTranscriptSessionContext(options?: { keepDanglingToolCalls?: boolean; collapseCompactedHistory?: boolean }) {
+		return this.sessionManager.buildSessionContext({ transcript: true, ...options });
+	}
 }
 
 describe("ACP event mapper", () => {
