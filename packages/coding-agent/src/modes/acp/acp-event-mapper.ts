@@ -37,6 +37,29 @@ interface AcpEventMapperOptions {
 	 * text. Defaults to treating every id as live.
 	 */
 	isTerminalLive?: (terminalId: string) => boolean;
+	/**
+	 * Whether the connected client understands the display-only terminal
+	 * `_meta` convention Zed's ACP bridge and `claude-agent-acp` use to render
+	 * a rich, expandable terminal block for output with no live client-owned
+	 * `terminal/create` terminal behind it: `terminal_info` on the tool
+	 * call's start, `terminal_output`/`terminal_exit` on its completion, all
+	 * keyed by an agent-chosen `terminal_id`. Negotiated from
+	 * `clientCapabilities._meta.terminal_output === true` at `initialize`.
+	 * When false, execute-kind tools with no live terminal fall back to a
+	 * fenced text block instead — the client cannot render the terminal
+	 * content otherwise.
+	 */
+	terminalMetaCapable?: boolean;
+	/**
+	 * Whether the connected client supports real, client-owned terminals
+	 * (`clientCapabilities.terminal === true`) — the live path `bash`/
+	 * `shell`/`exec` attempt via `terminal/create` before ever falling back
+	 * to the meta-terminal convention above. `eval` never uses a live
+	 * terminal regardless of this flag. Always `false` during `session/load`
+	 * replay: no live process exists to attach a new client terminal to, no
+	 * matter how capable the client is.
+	 */
+	realTerminalCapable?: boolean;
 }
 
 interface ContentArrayContainer {
@@ -232,30 +255,39 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return mapAssistantMessageEnd(event, sessionId, options);
 		case "tool_execution_start": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
-			const update = buildToolCallStartUpdate({
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				intent: event.intent,
-				cwd: options.cwd,
-			});
+			const update = buildToolCallStartUpdate(
+				{
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					args: event.args,
+					intent: event.intent,
+					cwd: options.cwd,
+				},
+				options,
+			);
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_update": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
-			const codeFence = shouldCodeFenceToolOutput(event.toolName);
-			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolName, event.args),
-				extractToolCallContent(event.partialResult, options, codeFence),
-			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
 				status: "in_progress",
 				rawOutput: event.partialResult,
 			};
-			if (content.length > 0) {
-				update.content = content;
+			// A meta-terminal call already got its (empty) terminal reference on
+			// `tool_execution_start`; there is no incremental-append story for it
+			// (see `wantsMetaTerminal`'s doc), so an in-progress update carries no
+			// content — the terminal fills in at `tool_execution_end`.
+			if (!wantsMetaTerminal(event.toolName, options)) {
+				const codeFence = shouldCodeFenceToolOutput(event.toolName);
+				const content = mergeToolUpdateContent(
+					buildToolStartContent(event.toolName, event.args),
+					extractToolCallContent(event.partialResult, options, codeFence),
+				);
+				if (content.length > 0) {
+					update.content = content;
+				}
 			}
 			const locations = extractToolLocations(event.args, options.cwd);
 			if (locations.length > 0) {
@@ -266,26 +298,48 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
-			const codeFence = shouldCodeFenceToolOutput(event.toolName);
-			const diffContent = extractDiffToolCallContent(event.result);
-			// A successful diff already shows the change; the tool's own text echo
-			// of the post-edit file (or an "applied" acknowledgement) just repeats
-			// it as a near-duplicate block below the diff. Only add that echo back
-			// when there's no diff, or the call partially failed — a per-file error
-			// message isn't represented by any diff and would otherwise be lost.
-			const resultContent =
-				diffContent.length > 0 && !event.isError
-					? diffContent
-					: [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
-			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
 				status: event.isError ? "failed" : "completed",
 				rawOutput: event.result,
 			};
-			if (content.length > 0) {
-				update.content = content;
+			if (wantsMetaTerminal(event.toolName, options)) {
+				// No live client-owned terminal exists for this call (see
+				// `wantsMetaTerminal`), so report the final output through the
+				// display-only terminal `_meta` convention instead of a fenced
+				// text block — matches `claude-agent-acp`'s `terminal_output`/
+				// `terminal_exit` shape, and (unlike a live terminal id) survives
+				// `session/load` replay verbatim since it carries no client-owned
+				// resource reference.
+				update.content = [terminalToolCallContent(event.toolCallId)];
+				update._meta = {
+					terminal_output: {
+						terminal_id: event.toolCallId,
+						data: extractReadableText(event.result) ?? "",
+					},
+					terminal_exit: {
+						terminal_id: event.toolCallId,
+						exit_code: extractExitCode(event.result, event.isError),
+						signal: null,
+					},
+				};
+			} else {
+				const codeFence = shouldCodeFenceToolOutput(event.toolName);
+				const diffContent = extractDiffToolCallContent(event.result);
+				// A successful diff already shows the change; the tool's own text echo
+				// of the post-edit file (or an "applied" acknowledgement) just repeats
+				// it as a near-duplicate block below the diff. Only add that echo back
+				// when there's no diff, or the call partially failed — a per-file error
+				// message isn't represented by any diff and would otherwise be lost.
+				const resultContent =
+					diffContent.length > 0 && !event.isError
+						? diffContent
+						: [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
+				const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
+				if (content.length > 0) {
+					update.content = content;
+				}
 			}
 			const locations = extractToolLocationsFromResult(event.result, options.cwd);
 			if (locations.length > 0) {
@@ -495,14 +549,17 @@ function isTodoStatus(status: unknown): status is TodoStatus {
 		status === "blocked"
 	);
 }
-export function buildToolCallStartUpdate(input: {
-	toolCallId: string;
-	toolName: string;
-	args: unknown;
-	intent?: string;
-	cwd?: string;
-	status?: "pending" | "completed";
-}): SessionUpdate {
+export function buildToolCallStartUpdate(
+	input: {
+		toolCallId: string;
+		toolName: string;
+		args: unknown;
+		intent?: string;
+		cwd?: string;
+		status?: "pending" | "completed";
+	},
+	options: AcpEventMapperOptions = {},
+): SessionUpdate {
 	const update: ToolCall & { sessionUpdate: "tool_call" } = {
 		sessionUpdate: "tool_call",
 		toolCallId: input.toolCallId,
@@ -511,9 +568,23 @@ export function buildToolCallStartUpdate(input: {
 		status: input.status ?? "pending",
 		rawInput: input.args,
 	};
-	const content = buildToolStartContent(input.toolName, input.args);
-	if (content.length > 0) {
-		update.content = content;
+	if (wantsMetaTerminal(input.toolName, options)) {
+		// Pre-register the display-only terminal under the tool call's own id
+		// (see `wantsMetaTerminal`) so its output/exit can land later, on
+		// `tool_execution_end`, purely through `_meta` — no live client-owned
+		// terminal is ever created for this call.
+		update.content = [terminalToolCallContent(input.toolCallId)];
+		update._meta = {
+			terminal_info: {
+				terminal_id: input.toolCallId,
+				...(input.cwd ? { cwd: input.cwd } : {}),
+			},
+		};
+	} else {
+		const content = buildToolStartContent(input.toolName, input.args);
+		if (content.length > 0) {
+			update.content = content;
+		}
 	}
 	const locations = extractToolLocations(input.args, input.cwd);
 	if (locations.length > 0) {
@@ -649,6 +720,43 @@ function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: 
 
 function isCommandToolName(toolName: string): boolean {
 	return toolName === "bash" || toolName === "shell" || toolName === "exec";
+}
+
+/**
+ * Whether this tool call should render via the display-only "meta terminal"
+ * convention (`_meta.terminal_info`/`terminal_output`/`terminal_exit`, keyed
+ * by the tool call's own id) instead of a live client-owned terminal or a
+ * fenced text block. `eval` never spawns a live terminal, so it always
+ * qualifies; `bash`/`shell`/`exec` only fall back to it when the live path
+ * (`terminal/create`) is unavailable — no real terminal capability, or
+ * `session/load` replay, where `realTerminalCapable` is forced `false`
+ * because no live process exists to attach a new client terminal to. Gated
+ * on `terminalMetaCapable` throughout: a client that doesn't understand the
+ * convention must get the fenced-text fallback instead of a dangling,
+ * unrenderable terminal reference.
+ */
+function wantsMetaTerminal(toolName: string, options: AcpEventMapperOptions): boolean {
+	if (!options.terminalMetaCapable) return false;
+	if (toolName === "eval") return true;
+	return isCommandToolName(toolName) && options.realTerminalCapable !== true;
+}
+
+/**
+ * `bash`/`shell`/`exec` only set `details.exitCode` on a nonzero exit (see
+ * `#buildCompletedResult`) — a successful run's process really did exit 0,
+ * it just isn't spelled out in the details object. Report that explicit 0
+ * rather than leaving the terminal's exit status blank, but never guess a
+ * number for an unattributed failure (wrong signal is worse than none).
+ */
+function extractExitCode(value: unknown, isError: boolean | undefined): number | undefined {
+	if (typeof value === "object" && value !== null) {
+		const details = (value as DetailsContainer).details;
+		if (typeof details === "object" && details !== null) {
+			const exitCode = (details as { exitCode?: unknown }).exitCode;
+			if (typeof exitCode === "number") return exitCode;
+		}
+	}
+	return isError ? undefined : 0;
 }
 
 /**

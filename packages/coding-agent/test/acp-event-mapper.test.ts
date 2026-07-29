@@ -957,6 +957,139 @@ describe("ACP event mapper", () => {
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "```\ndone\n```" } }]);
 	});
 
+	it("uses the meta-terminal convention for a stale replay terminal id when the client supports it", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-stale-meta",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "done" }],
+					details: { terminalId: "term-replay" },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ isTerminalLive: () => false, terminalMetaCapable: true, realTerminalCapable: false },
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{ type: string; terminalId?: string }>;
+			_meta?: Record<string, unknown>;
+		};
+		// The stale, connection-specific terminal id from `details` must never
+		// leak into the content reference — only the tool call's own id (stable
+		// across a `session/load` reconnect) can round-trip through replay.
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "tc-terminal-stale-meta" }]);
+		expect(update._meta).toEqual({
+			terminal_output: { terminal_id: "tc-terminal-stale-meta", data: "done" },
+			terminal_exit: { terminal_id: "tc-terminal-stale-meta", exit_code: 0, signal: null },
+		});
+	});
+
+	it("does not use the meta-terminal convention when a real client terminal is available", () => {
+		const start = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-real-terminal",
+				toolName: "bash",
+				args: { command: "echo hi" },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		)[0]!.update as { content?: unknown; _meta?: unknown };
+		// The live path still reports the real terminal id via a later
+		// tool_execution_update once `terminal/create` resolves — the pending
+		// start must not pre-empt it with a synthetic one.
+		expect("content" in start).toBe(false);
+		expect("_meta" in start).toBe(false);
+	});
+
+	it("registers a meta terminal on eval start and reports output/exit at the end", () => {
+		const startUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-eval-meta",
+				toolName: "eval",
+				args: { language: "py", title: "hello", code: "print('hi')" },
+				cwd: "/repo",
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, cwd: "/repo" },
+		);
+		expect(startUpdates).toHaveLength(1);
+		expectAcpNotifications(startUpdates);
+		const start = startUpdates[0]!.update as {
+			content?: Array<{ type: string; terminalId?: string }>;
+			_meta?: Record<string, unknown>;
+		};
+		expect(start.content).toEqual([{ type: "terminal", terminalId: "tc-eval-meta" }]);
+		expect(start._meta).toEqual({ terminal_info: { terminal_id: "tc-eval-meta", cwd: "/repo" } });
+
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-meta",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: "hi" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true },
+		);
+		expect(endUpdates).toHaveLength(1);
+		expectAcpNotifications(endUpdates);
+		const end = endUpdates[0]!.update as {
+			content?: Array<{ type: string; terminalId?: string }>;
+			_meta?: Record<string, unknown>;
+		};
+		expect(end.content).toEqual([{ type: "terminal", terminalId: "tc-eval-meta" }]);
+		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-eval-meta", data: "hi" },
+			terminal_exit: { terminal_id: "tc-eval-meta", exit_code: 0, signal: null },
+		});
+	});
+
+	it("never uses the meta-terminal convention when the client didn't advertise it", () => {
+		const start = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-eval-no-meta",
+				toolName: "eval",
+				args: { language: "py", code: "print('hi')" },
+			} as AgentSessionEvent,
+			"session-1",
+		)[0]!.update as { content?: Array<{ type: string }>; _meta?: unknown };
+		// Falls back to the existing collapsible source-echo content, not a
+		// terminal reference the client couldn't render.
+		expect(start.content?.some(item => item.type === "terminal")).toBe(false);
+		expect("_meta" in start).toBe(false);
+	});
+
+	it("reports a captured non-zero exit code through the meta-terminal convention", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-exit-code",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "boom" }],
+					details: { exitCode: 7 },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: false },
+		);
+		const update = updates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(update._meta).toEqual({
+			terminal_output: { terminal_id: "tc-terminal-exit-code", data: "boom" },
+			terminal_exit: { terminal_id: "tc-terminal-exit-code", exit_code: 7, signal: null },
+		});
+	});
+
 	it("fences plain command output visible without terminal details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{

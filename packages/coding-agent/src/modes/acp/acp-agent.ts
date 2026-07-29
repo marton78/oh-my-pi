@@ -485,6 +485,17 @@ export class AcpAgent implements Agent {
 		this.#createSession = createSession;
 	}
 
+	/**
+	 * Whether the connected client advertised the display-only terminal
+	 * `_meta` convention (see `wantsMetaTerminal` in acp-event-mapper.ts) at
+	 * `initialize`. Shared by every live/replay event-mapping call site so
+	 * eval/replayed-command output can render as a rich terminal block
+	 * instead of falling back to fenced text.
+	 */
+	#terminalMetaCapable(): boolean {
+		return this.#clientCapabilities?._meta?.terminal_output === true;
+	}
+
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
 		this.#cancelCleanupTimeoutMs = Math.max(1, timeoutMs);
 	}
@@ -1247,6 +1258,8 @@ export class AcpAgent implements Agent {
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
+			terminalMetaCapable: this.#terminalMetaCapable(),
+			realTerminalCapable: this.#clientCapabilities?.terminal === true,
 		})) {
 			const delivery = this.#connection.sessionUpdate(notification);
 			if (streamedAssistantError) {
@@ -2193,7 +2206,10 @@ export class AcpAgent implements Agent {
 								args,
 							},
 							sessionId,
-							{ cwd },
+							// No live client terminal can exist for a call replayed from a
+							// persisted transcript (see `#replayToolResult`'s matching note),
+							// so `realTerminalCapable` is forced `false` here too.
+							{ cwd, terminalMetaCapable: this.#terminalMetaCapable(), realTerminalCapable: false },
 						),
 					);
 					replayedToolCallIds.add(toolItem.id);
@@ -2248,19 +2264,30 @@ export class AcpAgent implements Agent {
 				errorMessage: message.errorMessage,
 			},
 		};
+		const terminalMetaCapable = this.#terminalMetaCapable();
 		const notifications = mapAgentSessionEventToAcpSessionUpdates(endEvent, sessionId, {
 			cwd,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
 			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
 			// Persisted `details.terminalId`s name terminals from the connection that
 			// ran the command. This client never created them and cannot resolve
-			// them, so replayed commands must render their recorded output as text.
+			// them, so replayed commands must render their recorded output as text
+			// (or, when the client supports it, the meta-terminal convention below).
 			isTerminalLive: () => false,
+			terminalMetaCapable,
+			realTerminalCapable: false,
 		});
 		if (options.includeStart === false) {
 			return notifications;
 		}
-		return [...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, { cwd }), ...notifications];
+		return [
+			...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, {
+				cwd,
+				terminalMetaCapable,
+				realTerminalCapable: false,
+			}),
+			...notifications,
+		];
 	}
 
 	#buildReplayToolArgs(details: unknown): { path?: string } {

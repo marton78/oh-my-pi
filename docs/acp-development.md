@@ -92,6 +92,26 @@ sent for the tool call you're working on before changing (or writing) any mapper
   update it in the same commit as the mapper change, not after.
 - Rebuild your mental model of "what Zed does with this" from the reference implementation
   or a live Zed session — never from assumption.
+- For any execute-kind tool call with no live client-owned terminal behind it (`eval`
+  always; `bash`/`shell`/`exec` whenever `terminal/create` isn't available — no real
+  terminal capability, or `session/load` replay, where no live process exists to attach a
+  new client terminal to), use the display-only terminal `_meta` convention instead of a
+  fenced text block: `_meta.terminal_info = {terminal_id, cwd}` on the tool call's
+  `pending` start (with `content: [{type: "terminal", terminalId}]` keyed by the tool
+  call's own id — never a real, connection-specific terminal id, which is meaningless
+  after `session/load`), then `_meta.terminal_output = {terminal_id, data}` and
+  `_meta.terminal_exit = {terminal_id, exit_code, signal}` on the final
+  `tool_call_update`. This is Zed's own ad hoc v1 extension (see
+  `crates/agent_servers/src/acp.rs`'s `handle_session_notification`, which builds a
+  `TerminalBuilder::new_display_only` terminal purely from this `_meta`, no RPC
+  involved) and exactly what `claude-agent-acp` does for its local Bash tool
+  (`toolInfoFromToolUse`/`toolUpdateFromToolResult` in `src/tools.ts`). Gate it on
+  `clientCapabilities._meta.terminal_output === true` (`AcpEventMapperOptions.
+  terminalMetaCapable` in `acp-event-mapper.ts`) — a client that doesn't understand the
+  convention must get the fenced-text fallback instead of a dangling terminal reference.
+  Because it's pure data (no client-owned resource), it renders identically whether
+  streamed live or replayed from a persisted transcript — unlike the real
+  `terminal/create` path, whose ids die with the connection.
 
 ## Don't
 
