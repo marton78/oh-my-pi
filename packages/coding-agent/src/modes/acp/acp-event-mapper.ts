@@ -231,9 +231,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "tool_execution_update": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
+			const codeFence = isCommandToolName(event.toolName) || event.toolName === "eval";
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, event.args),
-				extractToolCallContent(event.partialResult, options),
+				extractToolCallContent(event.partialResult, options, codeFence),
 			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
@@ -253,9 +254,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
+			const codeFence = isCommandToolName(event.toolName) || event.toolName === "eval";
 			const resultContent = [
 				...extractDiffToolCallContent(event.result),
-				...extractToolCallContent(event.result, options),
+				...extractToolCallContent(event.result, options, codeFence),
 			];
 			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
@@ -525,19 +527,21 @@ function getToolExecutionEndArgs(
 }
 
 function buildToolStartContent(toolName: string, args: unknown): ToolCallContent[] {
-	const text = buildToolStartText(toolName, args);
-	return text ? [textToolCallContent(text)] : [];
-}
-
-function buildToolStartText(toolName: string, args: unknown): string | undefined {
+	// Command tools show the command as the tool call's title; content stays
+	// empty until execution produces real output (a live terminal block, or a
+	// fenced fallback), so nothing duplicates the title.
 	if (isCommandToolName(toolName)) {
-		const command = extractStringProperty<CommandContainer>(args, "command");
-		return command ? limitText(`$ ${command}`) : undefined;
+		return [];
 	}
 	if (toolName === "eval") {
-		return buildEvalStartText(args);
+		const text = buildEvalStartText(args);
+		return text ? [textToolCallContent(text)] : [];
 	}
-	return undefined;
+	return [];
+}
+
+function commandText(args: unknown): string | undefined {
+	return extractStringProperty<CommandContainer>(args, "command");
 }
 
 function buildEvalStartText(args: unknown): string | undefined {
@@ -593,8 +597,8 @@ function isCommandToolName(toolName: string): boolean {
 
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
 	if (isCommandToolName(toolName)) {
-		const commandText = buildToolStartText(toolName, args);
-		if (commandText) return commandText;
+		const command = commandText(args);
+		if (command) return limitText(command);
 	}
 	if (toolName === "eval") {
 		const evalText = buildEvalStartText(args);
@@ -727,26 +731,51 @@ function terminalToolCallContent(terminalId: string): ToolCallContent {
 	return { type: "terminal", terminalId };
 }
 
-function extractToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
-	const richContent = extractStructuredToolCallContent(value, options);
+function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, codeFence: boolean): ToolCallContent[] {
+	const richContent = extractStructuredToolCallContent(value, options, codeFence);
 	const detailsImageContent = extractDetailsImageToolCallContent(value, options, richContent);
 	const combinedContent = [...richContent, ...detailsImageContent];
 	const terminalId = extractTerminalId(value);
-	const content =
-		terminalId && !hasTerminalContent(combinedContent, terminalId)
-			? [...combinedContent, terminalToolCallContent(terminalId)]
-			: combinedContent;
+	if (terminalId) {
+		// A live terminal already renders the command and its output as code;
+		// duplicating that as plain-text content gets markdown-rendered (`#`
+		// lines read as headings) and hides the terminal's own collapse control
+		// behind a redundant card. Keep non-text content (e.g. images) since
+		// that isn't otherwise represented in the terminal. A framework-level
+		// `errorMessage`/`message` note (e.g. "Permission request cancelled")
+		// isn't part of the raw command output the terminal shows, so it still
+		// surfaces here, unfenced.
+		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
+		const content = hasTerminalContent(nonTextContent, terminalId)
+			? nonTextContent
+			: [...nonTextContent, terminalToolCallContent(terminalId)];
+		const directText = extractDirectText(value);
+		if (!directText || hasEquivalentTextContent(content, directText)) {
+			return content;
+		}
+		return [...content, textToolCallContent(directText)];
+	}
+	// The value's `content` blocks (if any) already went through `richContent`
+	// above; re-deriving the same text from them as a "fallback" produces a
+	// near-duplicate block that differs only in trailing whitespace (richContent
+	// preserves it, `extractReadableText` trims it), so only fall back when
+	// structured extraction found no text at all.
+	if (combinedContent.some(item => item.type === "content" && item.content.type === "text")) {
+		return combinedContent;
+	}
 	const fallbackText = extractReadableText(value);
 	if (!fallbackText) {
-		return content;
+		return combinedContent;
 	}
-	if (hasEquivalentTextContent(content, fallbackText)) {
-		return content;
-	}
-	return [...content, textToolCallContent(fallbackText)];
+	const fenced = codeFence ? fenceCodeBlock(fallbackText) : fallbackText;
+	return [...combinedContent, textToolCallContent(fenced)];
 }
 
-function extractStructuredToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
+function extractStructuredToolCallContent(
+	value: unknown,
+	options: AcpEventMapperOptions,
+	codeFence: boolean,
+): ToolCallContent[] {
 	const blocks = getContentBlocks(value);
 	if (!blocks) {
 		return [];
@@ -754,7 +783,7 @@ function extractStructuredToolCallContent(value: unknown, options: AcpEventMappe
 
 	const content: ToolCallContent[] = [];
 	for (const block of blocks) {
-		const toolCallContent = toToolCallContent(block, options);
+		const toolCallContent = toToolCallContent(block, options, codeFence);
 		if (toolCallContent) {
 			content.push(toolCallContent);
 		}
@@ -773,7 +802,11 @@ function getContentBlocks(value: unknown): unknown[] | undefined {
 	return Array.isArray(content) ? content : undefined;
 }
 
-function toToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent | undefined {
+function toToolCallContent(
+	value: unknown,
+	options: AcpEventMapperOptions,
+	codeFence: boolean,
+): ToolCallContent | undefined {
 	const type = getContentType(value);
 	if (!type) {
 		return undefined;
@@ -782,7 +815,8 @@ function toToolCallContent(value: unknown, options: AcpEventMapperOptions): Tool
 	switch (type) {
 		case "text": {
 			const text = extractStructuredText(value);
-			return text ? textToolCallContent(text) : undefined;
+			if (!text) return undefined;
+			return textToolCallContent(codeFence ? fenceCodeBlock(text) : text);
 		}
 		case "image":
 		case "audio":
@@ -951,6 +985,23 @@ function hasTerminalContent(content: ToolCallContent[], terminalId: string): boo
 	return content.some(item => item.type === "terminal" && item.terminalId === terminalId);
 }
 
+/**
+ * A framework-level `text`/`errorMessage`/`message` field set directly on the
+ * result object (not nested in a `content` block array). Distinct from the
+ * raw command output a `content` array or a live terminal would carry, so
+ * it's safe to surface even when a terminal is already showing that output.
+ */
+function extractDirectText(value: unknown): string | undefined {
+	if (typeof value !== "object" || value === null) {
+		return undefined;
+	}
+	const directText =
+		extractStringProperty<TextLikeContent>(value, "text") ??
+		extractStringProperty<ErrorMessageContainer>(value, "errorMessage") ??
+		extractStringProperty<MessageContainer>(value, "message");
+	return directText ? normalizeText(directText) : undefined;
+}
+
 function extractReadableText(value: unknown): string | undefined {
 	if (typeof value === "string") {
 		return normalizeText(value);
@@ -962,12 +1013,9 @@ function extractReadableText(value: unknown): string | undefined {
 		return undefined;
 	}
 
-	const directText =
-		extractStringProperty<TextLikeContent>(value, "text") ??
-		extractStringProperty<ErrorMessageContainer>(value, "errorMessage") ??
-		extractStringProperty<MessageContainer>(value, "message");
+	const directText = extractDirectText(value);
 	if (directText) {
-		return normalizeText(directText);
+		return directText;
 	}
 
 	const contentBlocks = getContentBlocks(value);
@@ -986,22 +1034,8 @@ function extractReadableText(value: unknown): string | undefined {
 	if (extractDetailsImages(value)) {
 		return undefined;
 	}
-	if (isTerminalOnlyDetails(value)) {
-		return undefined;
-	}
 	const serialized = safeJsonStringify(value);
 	return normalizeText(serialized);
-}
-
-function isTerminalOnlyDetails(value: unknown): boolean {
-	if (typeof value !== "object" || value === null) {
-		return false;
-	}
-	if (extractTerminalId(value) === undefined) {
-		return false;
-	}
-	const content = (value as ContentArrayContainer).content;
-	return content === undefined || (Array.isArray(content) && content.length === 0);
 }
 
 export function extractAssistantMessageText(value: unknown): string {
@@ -1081,4 +1115,19 @@ function safeJsonStringify(value: unknown): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Wrap text in a Markdown fenced code block, widening the fence past any
+ * run of backticks already present in the text so a command's own ``` output
+ * can't prematurely close the fence. Used for command/eval output rendered
+ * without a live terminal (no ACP terminal capability) so `#`-prefixed lines
+ * (comments, Markdown-looking output) render as code, not headings.
+ */
+function fenceCodeBlock(text: string): string {
+	let fence = "```";
+	for (const match of text.matchAll(/^```+/gm)) {
+		while (match[0].length >= fence.length) fence += "`";
+	}
+	return `${fence}\n${text}\n${fence}`;
 }

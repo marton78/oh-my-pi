@@ -1372,16 +1372,14 @@ describe("ACP agent", () => {
 				rawInput: { command: "npm test" },
 			}),
 		);
-		expect(starts[0]).toEqual(
-			expect.objectContaining({
-				content: expect.arrayContaining([{ type: "content", content: { type: "text", text: "$ npm test" } }]),
-			}),
-		);
+		expect("content" in starts[0]!).toBe(false);
 		expect(starts.some(update => "rawInput" in update && JSON.stringify(update.rawInput) === "{}")).toBe(false);
 		expect(completions).toHaveLength(1);
 		expect(completions[0]).toEqual(
 			expect.objectContaining({
-				content: expect.arrayContaining([{ type: "content", content: { type: "text", text: "tests passed" } }]),
+				content: expect.arrayContaining([
+					{ type: "content", content: { type: "text", text: "```\ntests passed\n```" } },
+				]),
 			}),
 		);
 

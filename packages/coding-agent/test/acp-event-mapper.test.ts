@@ -198,7 +198,7 @@ describe("ACP event mapper", () => {
 		expect(doneUpdates).toEqual([]);
 	});
 
-	it("preserves command text when a new command tool is started", () => {
+	it("shows the command as the title without duplicating it in content", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -211,12 +211,10 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
-		};
+		const update = updates[0]!.update as { sessionUpdate: string; title: string; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
+		expect(update.title).toBe("npm run check");
+		expect("content" in update).toBe(false);
 	});
 
 	it("keeps internal Hub traffic off the ACP session stream", () => {
@@ -357,7 +355,7 @@ describe("ACP event mapper", () => {
 		expect(updates).toEqual([]);
 	});
 
-	it("uses command text for a new command tool even when intent is generic", () => {
+	it("uses raw command text for the title even when intent is generic", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -371,12 +369,9 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			title: string;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
-		};
-		expect(update.title).toBe("$ echo hi");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
+		const update = updates[0]!.update as { title: string; content?: unknown };
+		expect(update.title).toBe("echo hi");
+		expect("content" in update).toBe(false);
 	});
 
 	it("preserves eval source when a new eval tool is started", () => {
@@ -596,7 +591,7 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "src/foo.ts" }]);
 	});
 
-	it("preserves command text when a command tool update replaces content", () => {
+	it("shows only the live terminal for a command tool update, dropping the command echo", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -610,20 +605,12 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
-		};
+		const update = updates[0]!.update as { sessionUpdate: string; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
-		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
-		expect(update.content).not.toContainEqual({
-			type: "content",
-			content: { type: "text", text: '{"details":{"terminalId":"term-1"}}' },
-		});
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
 	});
 
-	it("preserves command text when tool update details accompany empty content", () => {
+	it("shows only the live terminal when details accompany empty content", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -637,20 +624,12 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
-		};
+		const update = updates[0]!.update as { sessionUpdate: string; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
-		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
-		expect(update.content).not.toContainEqual({
-			type: "content",
-			content: { type: "text", text: '{"content":[],"details":{"terminalId":"term-1"}}' },
-		});
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
 	});
 
-	it("keeps terminal content alongside readable text", () => {
+	it("drops raw output text once a live terminal already shows it", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -667,16 +646,12 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
-		};
+		const update = updates[0]!.update as { sessionUpdate: string; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "running" } });
-		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
 	});
 
-	it("keeps terminal content alongside readable end text", () => {
+	it("drops raw end-result text once a live terminal already shows it", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -693,16 +668,12 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
-		};
+		const update = updates[0]!.update as { sessionUpdate: string; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
-		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
 	});
 
-	it("preserves command text when a command tool final update replaces content", () => {
+	it("shows only the live terminal for a command tool's final update", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -723,14 +694,9 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
-		};
+		const update = updates[0]!.update as { sessionUpdate: string; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
-		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
 	});
 
 	it("keeps terminal content alongside readable error and message fields", () => {
@@ -777,7 +743,7 @@ describe("ACP event mapper", () => {
 		});
 	});
 
-	it("keeps plain command output visible without terminal details", () => {
+	it("fences plain command output visible without terminal details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -795,7 +761,9 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
 
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "hello from stdout" } }]);
+		expect(update.content).toEqual([
+			{ type: "content", content: { type: "text", text: "```\nhello from stdout\n```" } },
+		]);
 	});
 
 	it("embeds only terminal content from direct terminalId", () => {
@@ -840,7 +808,7 @@ describe("ACP event mapper", () => {
 		};
 		expect(update.content?.filter(item => item.type === "terminal" && item.terminalId === "term-1")).toHaveLength(1);
 	});
-	it("shows bash commands in visible tool call content", () => {
+	it("shows the raw command as the title of a pending bash tool call, without content", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -864,11 +832,11 @@ describe("ACP event mapper", () => {
 		};
 		expect(update.sessionUpdate).toBe("tool_call");
 		expect(update.toolCallId).toBe("toolu_bash_1");
-		expect(update.title).toBe("$ npm run check");
+		expect(update.title).toBe("npm run check");
 		expect(update.kind).toBe("execute");
 		expect(update.status).toBe("pending");
 		expect(update.rawInput).toEqual({ command: "npm run check", cwd: "/repo" });
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "$ npm run check" } }]);
+		expect("content" in update).toBe(false);
 	});
 
 	it("maps shell and exec tool starts as execute", () => {
@@ -892,7 +860,7 @@ describe("ACP event mapper", () => {
 			};
 			expect(update.sessionUpdate).toBe("tool_call");
 			expect(update.kind).toBe("execute");
-			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "$ echo hi" } }]);
+			expect("content" in update).toBe(false);
 		}
 	});
 
@@ -971,10 +939,8 @@ describe("ACP event mapper", () => {
 
 			expect(toolCall?.rawInput).toEqual({ command: "echo hi" });
 			expect(toolCall?.rawInput).not.toEqual({ input: { command: "echo hi" } });
-			expect(toolCall?.content).toEqual([{ type: "content", content: { type: "text", text: "$ echo hi" } }]);
-			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
-			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
-			expect(finalUpdate?.content).toContainEqual({ type: "terminal", terminalId: "term-replay" });
+			expect(toolCall?.content).toBeUndefined();
+			expect(finalUpdate?.content).toEqual([{ type: "terminal", terminalId: "term-replay" }]);
 		} finally {
 			abortController.abort();
 			await fs.promises.rm(root, { recursive: true, force: true });
@@ -993,12 +959,12 @@ describe("ACP event mapper", () => {
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_1",
-			title: "$ npm test",
+			title: "npm test",
 			kind: "execute",
 			status: "completed",
 			rawInput: { command: "npm test", cwd: "/repo" },
-			content: [{ type: "content", content: { type: "text", text: "$ npm test" } }],
 		});
+		expect("content" in update).toBe(false);
 	});
 
 	it("builds replayed read tool-call locations against the replay cwd", () => {
@@ -1058,11 +1024,11 @@ describe("ACP event mapper", () => {
 		expect(replayArgs.args).toBe(rawArgs);
 		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
 		expect(update).toMatchObject({
-			title: "$ bun test",
+			title: "bun test",
 			status: "completed",
 			rawInput: rawArgs,
-			content: [{ type: "content", content: { type: "text", text: "$ bun test" } }],
 		});
+		expect("content" in update).toBe(false);
 	});
 	it("does not add command text content to non-command tool starts", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
