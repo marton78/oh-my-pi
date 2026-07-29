@@ -267,10 +267,16 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
 			const codeFence = shouldCodeFenceToolOutput(event.toolName);
-			const resultContent = [
-				...extractDiffToolCallContent(event.result),
-				...extractToolCallContent(event.result, options, codeFence),
-			];
+			const diffContent = extractDiffToolCallContent(event.result);
+			// A successful diff already shows the change; the tool's own text echo
+			// of the post-edit file (or an "applied" acknowledgement) just repeats
+			// it as a near-duplicate block below the diff. Only add that echo back
+			// when there's no diff, or the call partially failed — a per-file error
+			// message isn't represented by any diff and would otherwise be lost.
+			const resultContent =
+				diffContent.length > 0 && !event.isError
+					? diffContent
+					: [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
 			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
@@ -681,6 +687,17 @@ function buildToolTitle(toolName: string, args: unknown, intent: string | undefi
 		if (evalTitle) return evalTitle;
 	}
 	const trimmedIntent = intent?.trim();
+	if (toolName === "edit") {
+		// The edit tool's target path lives in a top-level `path` arg (patch/replace
+		// modes) or is embedded in the `input` payload (hashline header / apply_patch
+		// marker) — neither is caught by the generic path/command/pattern/query
+		// subject fallback below, so a bare "edit" title (or the description alone,
+		// with no file name at all) was all a client had to show.
+		const editPath = extractEditPath(args);
+		if (editPath) {
+			return trimmedIntent ? `${trimmedIntent} — ${editPath}` : `Edit ${editPath}`;
+		}
+	}
 	if (trimmedIntent) {
 		return trimmedIntent;
 	}
@@ -1176,6 +1193,28 @@ function hasBinaryContentBlock(blocks: unknown[]): boolean {
 		const type = getContentType(block);
 		return type === "image" || type === "audio";
 	});
+}
+
+/**
+ * The edit tool's target file path: a top-level `path` arg for patch/replace
+ * modes, or embedded in the `input` payload for hashline (`[path#TAG]`
+ * header) / apply_patch (`*** Update File: path`) modes. Mirrors
+ * `extractApprovalPath` in `src/edit/index.ts` — kept local (rather than
+ * imported) since that helper returns the sentinel `"(unknown)"` for the
+ * approval-prompt use case, not `undefined`.
+ */
+function extractEditPath(args: unknown): string | undefined {
+	if (typeof args !== "object" || args === null) {
+		return undefined;
+	}
+	const input = extractStringProperty<{ input?: unknown }>(args, "input");
+	if (input) {
+		const hashlineMatch = /^\[([^#\r\n]+)(?:#[0-9a-fA-F]{4})?\]/m.exec(input);
+		if (hashlineMatch?.[1]) return hashlineMatch[1];
+		const applyPatchMatch = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/m.exec(input);
+		if (applyPatchMatch?.[1]) return applyPatchMatch[1].trim();
+	}
+	return extractStringProperty<PathContainer>(args, "path");
 }
 
 function extractStringProperty<T extends object>(value: unknown, key: keyof T): string | undefined {

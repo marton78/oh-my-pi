@@ -528,6 +528,103 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "single.ts" }]);
 	});
 
+	it("drops the redundant text echo when a successful edit already has a diff", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-edit-no-echo",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "applied" }],
+					details: { path: "single.ts", oldText: "before\n", newText: "after\n" },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
+		};
+		expect(update.content).toEqual([{ type: "diff", path: "single.ts", oldText: "before\n", newText: "after\n" }]);
+	});
+
+	it("keeps the text content when a partially-failed edit has no diff for the failed file", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-edit-partial-fail",
+				toolName: "edit",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "Error editing skipped.ts: boom" }],
+					details: {
+						perFileResults: [
+							{ path: "foo.ts", diff: "...", oldText: "before\n", newText: "after\n" },
+							{ path: "skipped.ts", diff: "", isError: true, errorText: "boom" },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: unknown;
+			}>;
+		};
+		expect(update.content).toContainEqual({ type: "diff", path: "foo.ts", oldText: "before\n", newText: "after\n" });
+		expect(update.content).toContainEqual({
+			type: "content",
+			content: { type: "text", text: "```\nError editing skipped.ts: boom\n```" },
+		});
+	});
+
+	it("includes the target file in the edit tool's title for every edit mode", () => {
+		const pathStart = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-edit-title-path",
+				toolName: "edit",
+				args: { path: "src/foo.ts", edits: [] },
+				intent: "Fix the off-by-one bug",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const hashlineStart = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-edit-title-hashline",
+				toolName: "edit",
+				args: { input: "[src/bar.ts#1A2B]\nSWAP 3.=3:\n+fixed()\n" },
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const applyPatchStart = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-edit-title-apply-patch",
+				toolName: "edit",
+				args: { input: "*** Begin Patch\n*** Update File: src/baz.ts\n@@\n-old\n+new\n*** End Patch\n" },
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expectAcpNotifications([...pathStart, ...hashlineStart, ...applyPatchStart]);
+		expect((pathStart[0]!.update as { title?: string }).title).toBe("Fix the off-by-one bug — src/foo.ts");
+		expect((hashlineStart[0]!.update as { title?: string }).title).toBe("Edit src/bar.ts");
+		expect((applyPatchStart[0]!.update as { title?: string }).title).toBe("Edit src/baz.ts");
+	});
+
 	it("resolves live image blob refs for ACP content without expanding rawOutput", () => {
 		const blobRef = "blob:sha256:77467fcfe2bbdc034e0eabb4778c9d7de521c0d7c3e0d0a62566468e4d7da3a5";
 		const resolvedImageData = "resolved-webp-base64";
