@@ -610,6 +610,16 @@ function trimTailToLineBoundary(text: string): string {
 }
 
 /**
+ * Footer pointing at the artifact that holds the pre-elision text. Callers that
+ * need to re-state the footer out of band (e.g. bash surfacing it as a
+ * structured notice when the inline body is replaced by a terminal widget)
+ * share this formatter so the two spellings can't drift.
+ */
+export function formatRawOutputArtifactNotice(artifactId: string): string {
+	return `[raw output: artifact://${artifactId}]`;
+}
+
+/**
  * Final-defense inline size guard for tool results.
  *
  * No-op when `text` fits within `maxBytes` (the common path). Otherwise keeps
@@ -633,7 +643,7 @@ export async function enforceInlineByteCap(text: string, options: InlineByteCapO
 	const artifactId = await options.saveArtifact?.(text);
 	if (artifactId) {
 		const sep = composed.endsWith(NL) ? "" : NL;
-		composed += `${sep}[raw output: artifact://${artifactId}]`;
+		composed += `${sep}${formatRawOutputArtifactNotice(artifactId)}`;
 	}
 	return composed;
 }
