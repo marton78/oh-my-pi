@@ -104,10 +104,6 @@ interface NoticesContainer {
 	notices?: unknown;
 }
 
-interface OutputMetaContainer {
-	meta?: unknown;
-}
-
 interface BinaryLikeContent extends TypedValue {
 	data?: unknown;
 	mimeType?: unknown;
@@ -1018,50 +1014,29 @@ function buildMetaTerminalDelta(
 }
 
 /**
- * `details.meta` from a tool result, typed as `OutputMeta` — the same shape
- * `extractOutputNoticeText` reads for the fenced-text path, reused here to
- * detect display re-rendering on the meta-terminal path.
- */
-function extractOutputMeta(value: unknown): OutputMeta | undefined {
-	if (typeof value !== "object" || value === null) return undefined;
-	const details = (value as DetailsContainer).details;
-	if (typeof details !== "object" || details === null) return undefined;
-	const meta = (details as OutputMetaContainer).meta;
-	return typeof meta === "object" && meta !== null ? (meta as OutputMeta) : undefined;
-}
-
-/**
- * Whether `result`'s final text has been reformatted for the model rather
- * than appended to verbatim: `limits.columnTruncated` (per-line cap, default
- * 768 chars — `tools.maxColumn`) and `truncation` (head/tail elision past
- * the artifact-spill threshold) both mean the string handed to
- * `tool_execution_end` is a *display re-render* of bytes already streamed,
- * not a continuation of the raw byte stream `buildMetaTerminalDelta`
- * expects. Diffing a re-render against the raw watermark produces a false
- * zero-overlap read — a line truncated mid-stream at the column cap rarely
- * shares a byte-for-byte suffix with the raw tail it replaced — which fires
- * `buildMetaTerminalDelta`'s discontinuity-resync branch even though
- * nothing was lost from the terminal card the user is already looking at.
- */
-function isDisplayReRenderedResult(result: unknown): boolean {
-	const meta = extractOutputMeta(result);
-	return meta?.limits?.columnTruncated !== undefined || meta?.truncation !== undefined;
-}
-
-/**
- * `buildMetaTerminalDelta` specialized for `tool_execution_end`: once a
- * prefix has already streamed live (`tool_execution_update`) and the final
- * result is a display re-render (see `isDisplayReRenderedResult`), skip the
- * byte-diff entirely instead of feeding it a snapshot that was never meant
- * to be compared byte-for-byte — the client already has every byte the
- * terminal showed live, so a "discontinuity" notice plus a re-sent,
- * truncated tail would be pure noise. Any genuinely new facts (exit code
- * beyond `terminal_exit`, wall time, an `artifact://` recovery pointer) still
- * ride through as a notice, same convention as `buildLiveTerminalNoticeMeta`.
- * Falls through to the normal byte-diff path whenever nothing has streamed
- * yet for this call (the "raw" and "re-rendered" forms coincide on first
- * delivery) or the result is a plain continuation, so genuine truncation and
- * tail-buffer rollover still resync correctly.
+ * `buildMetaTerminalDelta` specialized for `tool_execution_end`. A final
+ * result is not guaranteed to be a byte-wise continuation of the raw stream
+ * `tool_execution_update` delivered — `eval.ts` trims leading/trailing
+ * whitespace off its final output, column truncation and head/tail elision
+ * both re-render already-streamed lines — and there is no enumerable list
+ * of every normalization a producer might apply. All of them are lossy
+ * summaries: a display re-render can only shrink or preserve the raw bytes
+ * already streamed, never exceed them. So instead of running the
+ * literal-byte `deliveredOverlap` scan (which finds spurious partial
+ * matches on self-similar output — repeated characters or lines coincide
+ * with an unrelated tail by pure chance), a final snapshot no longer than
+ * what already streamed is treated as "not a continuation" rather than
+ * "bytes were lost": there is nothing left to resync for at the last
+ * frame, so fabricating a "[terminal output discontinuity]" notice and
+ * re-sending a re-rendered/truncated body would be pure noise on top of
+ * what the user already watched stream live. Genuinely new facts (wall
+ * time, an `artifact://` recovery pointer, a real truncation warning)
+ * still ride through via `details.notices`, same convention as
+ * `buildLiveTerminalNoticeMeta`. Falls through to the normal byte-diff path
+ * whenever nothing has streamed yet for this call (first delivery has no
+ * watermark to diverge from) or the final result is strictly longer than
+ * what streamed — the only way that happens is genuine new output, so
+ * `buildMetaTerminalDelta`'s overlap/rollover handling still applies.
  */
 function buildFinalMetaTerminalDelta(
 	toolCallId: string,
@@ -1072,11 +1047,12 @@ function buildFinalMetaTerminalDelta(
 	options: AcpEventMapperOptions,
 ): string | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
-	if (prior !== undefined && isDisplayReRenderedResult(result)) {
-		const notices = extractDetailsNotices(result);
-		return notices ? `\n${notices}\n` : undefined;
+	if (prior === undefined || cumulativeOutput.length > prior.length) {
+		return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
 	}
-	return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
+	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
+	const notices = extractDetailsNotices(result);
+	return notices ? `\n${notices}\n` : undefined;
 }
 
 /**

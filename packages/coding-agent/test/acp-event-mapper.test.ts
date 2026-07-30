@@ -2097,6 +2097,108 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("does not report a discontinuity when the final result merely re-normalizes whitespace it already streamed", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4820360199): the
+		// re-render markers (`limits.columnTruncated`, `truncation`) are not
+		// the only way a `tool_execution_end` result stops being a byte-wise
+		// continuation of the streamed watermark. `eval.ts` builds its final
+		// output from `result.output.trim()`, so streamed "  indented\n"
+		// becomes "indented" with *no* meta marker at all: no suffix of the
+		// watermark is a prefix of the final text, `deliveredOverlap` reads
+		// zero, and the rollover-resync branch fabricates a data-loss warning
+		// plus a duplicate re-send of output the user is already looking at.
+		// On the final frame of a call that has already streamed, a
+		// non-continuation must never be reported as dropped bytes.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-trimmed",
+				toolName: "eval",
+				args: { language: "python", code: "print('  indented')" },
+				partialResult: { content: [{ type: "text", text: "  indented\n" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-trimmed",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: "indented" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(end._meta).toEqual({
+			terminal_exit: { terminal_id: "tc-trimmed", exit_code: 0, signal: null },
+		});
+	});
+
+	it("does not diff a middle-elided final result against the raw watermark as a discontinuity", () => {
+		// Same class as the column-truncation case, via the other re-render
+		// mechanism named in review 4820560308: head/tail elision past the
+		// artifact-spill threshold sets `details.meta.truncation`, and the
+		// elided body shares no byte-for-byte suffix with the raw streamed
+		// tail. The genuine facts (bytes were dropped by the *producer*, and
+		// where to recover them) travel as notices, not as a fabricated
+		// terminal-stream discontinuity.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-elided",
+				toolName: "bash",
+				args: { command: "yes hello | head -c 60000" },
+				partialResult: { content: [{ type: "text", text: "hello\n".repeat(10000) }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-elided",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: `${"hello\n".repeat(100)}… [elided] …\n${"hello\n".repeat(100)}` }],
+					details: {
+						notices: ["(output truncated)", "[raw output: artifact://7]"],
+						meta: { truncation: { omittedBytes: 40000 } },
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(end._meta).toEqual({
+			terminal_output: {
+				terminal_id: "tc-elided",
+				data: "\n(output truncated)\n[raw output: artifact://7]\n",
+			},
+			terminal_exit: { terminal_id: "tc-elided", exit_code: 0, signal: null },
+		});
+	});
+
 	it("fuzz: deliveredOverlap matches a brute-force reference across randomized byte strings", () => {
 		// This function has been the single densest source of review findings
 		// in this subsystem (4096-byte trial cap, in-band NUL-separator
