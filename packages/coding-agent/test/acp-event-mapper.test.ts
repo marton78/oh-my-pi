@@ -631,6 +631,58 @@ describe("ACP event mapper", () => {
 		expect(textBlocks[0]?.content?.text).toBe(`\`\`\`\n${formatOutputNotice(meta).trim()}\n\`\`\``);
 	});
 
+	it("preserves per-file LSP diagnostics for a multi-file edit with no top-level aggregate meta", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4820222626):
+		// `executeApplyPatchPerFile`'s multi-file aggregate has no top-level
+		// `details.meta` at all — each file's own `meta` (with its own
+		// diagnostics) lives only in `details.perFileResults[].meta`
+		// (`edit/index.ts`). `extractOutputNoticeText` only read the aggregate
+		// `details.meta`, so per-file diagnostics silently disappeared for
+		// every successful or partially-failed multi-file edit.
+		const metaA = { diagnostics: { summary: "1 warning", messages: ["a.ts:3: unused import"] } };
+		const metaB = { diagnostics: { summary: "1 error", messages: ["b.ts:5: undefined name"] } };
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-multi-file-diagnostics",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts\nUpdated b.ts" }],
+					details: {
+						perFileResults: [
+							{ path: "a.ts", diff: "...", oldText: "before-a\n", newText: "after-a\n", meta: metaA },
+							{ path: "b.ts", diff: "...", oldText: "before-b\n", newText: "after-b\n", meta: metaB },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
+		expect(diffBlocks).toEqual([
+			{ type: "diff", path: "a.ts", oldText: "before-a\n", newText: "after-a\n" },
+			{ type: "diff", path: "b.ts", oldText: "before-b\n", newText: "after-b\n" },
+		]);
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe(
+			`\`\`\`\na.ts: ${formatOutputNotice(metaA).trim()}\n\nb.ts: ${formatOutputNotice(metaB).trim()}\n\`\`\``,
+		);
+	});
+
 	it("preserves LSP diagnostics alongside a partially-failed edit's per-file failure text", () => {
 		// Same discard, mirrored for the error branch: `extractEditFailureText`
 		// reads only `perFileResults`, so a diagnostics notice attached to the

@@ -1331,14 +1331,36 @@ function extractPrunedEditPathsText(result: unknown): string | undefined {
  * this notice down with it — diagnostics on a successful edit are exactly as
  * real as diagnostics on any other tool call and must survive next to the
  * diff, not just in "Copy as Markdown" export.
+ *
+ * `executeApplyPatchPerFile`'s multi-file aggregate has no top-level
+ * `details.meta` at all — each file's own `meta` (with its own diagnostics)
+ * lives only in `details.perFileResults[].meta` (see `edit/index.ts`). Scan
+ * those too, prefixed by path since distinct files can carry distinct
+ * notices, and dedupe against the aggregate in case the two ever coincide.
  */
 function extractOutputNoticeText(result: unknown): string | undefined {
 	if (typeof result !== "object" || result === null) return undefined;
 	const details = (result as { details?: unknown }).details;
 	if (typeof details !== "object" || details === null) return undefined;
-	const meta = (details as { meta?: OutputMeta }).meta;
-	const notice = formatOutputNotice(meta).trim();
-	return notice.length > 0 ? notice : undefined;
+	const notices: string[] = [];
+	const seen = new Set<string>();
+	const pushNotice = (meta: OutputMeta | undefined, path: string | undefined) => {
+		const notice = formatOutputNotice(meta).trim();
+		if (!notice || seen.has(notice)) return;
+		seen.add(notice);
+		notices.push(path ? `${path}: ${notice}` : notice);
+	};
+	pushNotice((details as { meta?: OutputMeta }).meta, undefined);
+	const perFile = (details as { perFileResults?: unknown }).perFileResults;
+	if (Array.isArray(perFile)) {
+		for (const entry of perFile) {
+			if (typeof entry !== "object" || entry === null) continue;
+			const candidate = entry as { path?: unknown; meta?: OutputMeta };
+			const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
+			pushNotice(candidate.meta, path);
+		}
+	}
+	return notices.length > 0 ? notices.join("\n\n") : undefined;
 }
 
 function buildDiffContent(entry: unknown): ToolCallContent | undefined {
