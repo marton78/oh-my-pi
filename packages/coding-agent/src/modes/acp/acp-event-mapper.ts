@@ -381,7 +381,13 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// file's own ack line (e.g. "Updated foo.ts") alongside the failure —
 				// re-adding all of it here would duplicate those already-diffed files'
 				// content. Use only the per-file error text in that case instead of the
-				// full joined echo.
+				// full joined echo — `extractEditFailureText` needs `perFileResults`,
+				// which only exists for `patch`'s multi-file path. `apply_patch`'s
+				// single-target aggregation (`executeSinglePathEntries`) instead
+				// returns one aggregate `diff`/`oldText`/`newText` with the
+				// entry-by-entry failure guidance folded into the joined result text,
+				// so fall back to that when there's no per-file breakdown to draw
+				// from.
 				let resultContent: ToolCallContent[];
 				if (diffContent.length > 0 && !event.isError) {
 					const prunedText = extractPrunedEditPathsText(event.result);
@@ -389,7 +395,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(prunedText) : prunedText)]
 						: diffContent;
 				} else if (diffContent.length > 0 && event.isError) {
-					const failureText = extractEditFailureText(event.result);
+					const failureText = extractEditFailureText(event.result) ?? extractReadableText(event.result);
 					resultContent = failureText
 						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(failureText) : failureText)]
 						: diffContent;

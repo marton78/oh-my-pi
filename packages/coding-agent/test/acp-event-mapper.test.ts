@@ -763,6 +763,61 @@ describe("ACP event mapper", () => {
 		);
 	});
 
+	it("falls back to the joined result text for a single-path aggregate edit failure with no perFileResults", () => {
+		// Regression test: `apply_patch`'s single-target aggregation
+		// (`executeSinglePathEntries`) returns one aggregate `diff`/`oldText`/
+		// `newText` with no `perFileResults` array at all — `extractEditFailureText`
+		// requires `perFileResults` and returned `undefined`, so this branch fell
+		// straight to `diffContent` alone, silently dropping the "entry N was NOT
+		// applied" guidance that only exists in the joined text echo.
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-edit-single-path-aggregate-fail",
+				toolName: "edit",
+				isError: true,
+				result: {
+					content: [
+						{
+							type: "text",
+							text: "Error editing single.ts (entry 2 of 3): boom\nEntry 1 was already applied.\nEntry 3 was NOT applied; re-read the file and re-issue only the failed and unapplied entries.",
+						},
+					],
+					details: {
+						path: "single.ts",
+						diff: "...",
+						oldText: "before\n",
+						newText: "after-entry-1\n",
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		expect(update.content).toContainEqual({
+			type: "diff",
+			path: "single.ts",
+			oldText: "before\n",
+			newText: "after-entry-1\n",
+		});
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe(
+			"```\nError editing single.ts (entry 2 of 3): boom\nEntry 1 was already applied.\nEntry 3 was NOT applied; re-read the file and re-issue only the failed and unapplied entries.\n```",
+		);
+	});
+
 	it("includes the target file in the edit tool's title for every edit mode", () => {
 		const pathStart = mapAgentSessionEventToAcpSessionUpdates(
 			{
