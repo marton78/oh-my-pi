@@ -463,8 +463,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				// appended to its rendered `output` live so a long-running cell (e.g. a
 				// sleep loop) shows progress instead of nothing until it returns. A
 				// dedicated per-cell tail buffer keeps attribution correct and avoids
-				// double-counting against the aggregate `tailBuffer`; on completion the
-				// authoritative `cellResult.output` (below) overwrites this live tail.
+				// double-counting against the aggregate `tailBuffer`. `tailBuffer` is
+				// append-only (it backs a live progress stream, never replaced): at
+				// completion below, only the parts of `cellOutput` never streamed via
+				// `OutputSink.onChunk` (display/image notes) are appended — re-adding
+				// the already-streamed stdout would duplicate it.
 				let activeLiveCell: { result: EvalCellResult; buf: TailBuffer } | undefined;
 
 				const appendTail = (text: string) => {
@@ -652,7 +655,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 					if (cellOutput) {
 						cellOutputs.push(cellOutput);
-						appendTail(cellOutput);
+						if (visibleDisplayText) {
+							appendTail(stdoutTrimmed ? `\n\n${visibleDisplayText}` : visibleDisplayText);
+						}
 					}
 
 					if (result.cancelled) {

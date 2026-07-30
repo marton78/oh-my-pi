@@ -86,6 +86,49 @@ describe("EvalTool live stdout streaming", () => {
 		expect(result.details?.cells?.[0]?.output).toContain("tick 2");
 	});
 
+	/**
+	 * Regression test for the double-append bug: `onChunk` streams raw stdout
+	 * into the aggregate progress tail live, and completion used to re-append
+	 * the same (trimmed) stdout as `cellOutput` on top of it, producing a
+	 * shrinking, duplicated final snapshot (`one\ntwo\none\ntwo` followed by a
+	 * shorter `one\ntwo`). The aggregate tail sent via `onUpdate({ content })`
+	 * must never shrink or duplicate already-streamed bytes across ticks.
+	 */
+	it("never re-appends already-streamed stdout into the aggregate progress tail on cell completion", async () => {
+		const tailTexts: string[] = [];
+		vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation((async (
+			_code: string,
+			options: { onChunk?: (chunk: string) => void },
+		) => {
+			options.onChunk?.("one\n");
+			options.onChunk?.("two\n");
+			return baseResult({ output: "one\ntwo\n" });
+		}) as never);
+
+		const tool = new EvalTool(makeSession());
+		const result = await tool.execute(
+			"call-no-double-append",
+			{ language: "js", code: "print('one'); print('two')" },
+			undefined,
+			update => {
+				const text = update.content.find(c => c.type === "text")?.text;
+				if (typeof text === "string") tailTexts.push(text);
+			},
+		);
+
+		// Every progress snapshot must extend the previous one (never shrink),
+		// and no snapshot may duplicate bytes already delivered.
+		for (let i = 1; i < tailTexts.length; i++) {
+			expect(tailTexts[i]!.startsWith(tailTexts[i - 1]!)).toBe(true);
+		}
+		const finalTail = tailTexts.at(-1) ?? "";
+		expect(finalTail).toBe("one\ntwo\n");
+		expect(finalTail).not.toContain("one\ntwo\none");
+
+		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		expect(text).toBe("one\ntwo");
+	});
+
 	it("preserves the column-cap notice after rebuilding the final eval summary", async () => {
 		const settings = Settings.isolated();
 		settings.set("tools.outputMaxColumns", 8);
