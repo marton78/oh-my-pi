@@ -1284,17 +1284,37 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
 
 /**
  * Narrow a tool result's `details` to `EditToolDetails`, validating
- * `perFileResults` is an array when present. `unknown` at the boundary is
- * unavoidable — arbitrary/MCP tool results have no such shape — but every
- * edit-result consumer below shares this one cast instead of re-deriving its
- * own `{ perFileResults?: unknown }` view of the same field.
+ * `perFileResults` is an array of well-shaped entries when present.
+ * `unknown` at the boundary is unavoidable — arbitrary/MCP tool results have
+ * no such shape — but every edit-result consumer below shares this one cast
+ * instead of re-deriving its own `{ perFileResults?: unknown }` view of the
+ * same field.
+ *
+ * Validates each entry is a non-null object with a string `path` (the one
+ * field every consumer below dereferences unconditionally —
+ * `extractOutputNoticeText` reads `entry.path.length`, `buildDiffContent`
+ * reads `entry.isError`/`entry.path`). An extension/custom tool's arbitrary
+ * `details.perFileResults` (e.g. `[{}]` or `[null]`) previously passed this
+ * check as long as it was an array, so a malformed entry threw inside the
+ * mapper and dropped the tool's entire ACP update instead of just skipping
+ * the edit-specific rendering it doesn't apply to (oh-my-pi/oh-my-pi#7078
+ * review 4823537229). Rejecting the whole `details` on a bad entry — instead
+ * of trying to salvage the well-shaped ones — is deliberate: a partially
+ * malformed `perFileResults` isn't a real edit result to begin with, and
+ * every caller already has a non-edit fallback path.
  */
 function asEditDetails(result: unknown): EditToolDetails | undefined {
 	if (typeof result !== "object" || result === null) return undefined;
 	const details = (result as DetailsContainer).details;
 	if (typeof details !== "object" || details === null) return undefined;
 	const perFileResults = (details as PerFileResultsContainer).perFileResults;
-	if (perFileResults !== undefined && !Array.isArray(perFileResults)) return undefined;
+	if (perFileResults !== undefined) {
+		if (!Array.isArray(perFileResults)) return undefined;
+		const wellFormed = perFileResults.every(
+			entry => typeof entry === "object" && entry !== null && "path" in entry && typeof entry.path === "string",
+		);
+		if (!wellFormed) return undefined;
+	}
 	return details as EditToolDetails;
 }
 

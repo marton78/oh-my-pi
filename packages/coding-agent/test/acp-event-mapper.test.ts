@@ -3181,4 +3181,63 @@ describe("ACP event mapper", () => {
 		});
 		expectAcpStructureRejects(arkSessionNotification, { ...notification, sessionId: 42 });
 	});
+
+	it("does not crash on a malformed perFileResults entry from an arbitrary tool", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4823537229):
+		// `asEditDetails` accepted any `details.perFileResults` array as long as
+		// it was an array, so an extension/custom/MCP tool result carrying
+		// `perFileResults: [{}]` or `[null]` — a shape no built-in edit tool
+		// produces, but nothing prevents an arbitrary tool from setting — threw
+		// inside `extractOutputNoticeText` (`entry.path.length` on a path-less
+		// entry) or `buildDiffContent` (`entry.isError` on `null`), dropping the
+		// tool's entire ACP update instead of just skipping the edit-specific
+		// rendering it doesn't apply to.
+		expect(() =>
+			mapUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: "tc-malformed-per-file-empty",
+					toolName: "custom_mcp_tool",
+					isError: false,
+					result: {
+						content: [{ type: "text", text: "ok" }],
+						details: { terminalId: "term-malformed", perFileResults: [{}] },
+					},
+				} as unknown as AgentSessionEvent,
+				"session-1",
+				{ terminalMetaCapable: false },
+			),
+		).not.toThrow();
+
+		expect(() =>
+			mapUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: "tc-malformed-per-file-null",
+					toolName: "custom_mcp_tool",
+					isError: false,
+					result: {
+						content: [{ type: "text", text: "ok" }],
+						details: { perFileResults: [null] },
+					},
+				} as unknown as AgentSessionEvent,
+				"session-1",
+			),
+		).not.toThrow();
+
+		// Falls back to the plain-content path instead of the (skipped)
+		// edit-specific diff/notice rendering.
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-malformed-per-file-fallback",
+				toolName: "custom_mcp_tool",
+				isError: false,
+				result: { content: [{ type: "text", text: "ok" }], details: { perFileResults: [{}] } },
+			} as unknown as AgentSessionEvent,
+			"session-1",
+		);
+		const update = updates[0]!.update as { content?: { type: string; content?: { type?: string; text?: string } }[] };
+		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "ok" } }]);
+	});
 });
