@@ -470,7 +470,21 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				// the already-streamed stdout would duplicate it.
 				let activeLiveCell: { result: EvalCellResult; buf: TailBuffer } | undefined;
 
+				// Mirrors the `"\n\n"` join between entries of `cellOutputs` below
+				// (the eventual authoritative `combinedOutput`) so the *streamed*
+				// tail — the live ACP meta-terminal watches this cumulative text —
+				// never diverges from what the final result actually contains. Set
+				// right after a cell contributes non-empty output (see
+				// `cellOutputs.push` below); consumed by the next contribution,
+				// whichever cell that turns out to be, so a cell that itself
+				// produces nothing doesn't insert a spurious blank gap.
+				let awaitingCellSeparator = false;
 				const appendTail = (text: string) => {
+					if (!text) return;
+					if (awaitingCellSeparator) {
+						tailBuffer.append("\n\n");
+						awaitingCellSeparator = false;
+					}
 					tailBuffer.append(text);
 				};
 
@@ -658,6 +672,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						if (visibleDisplayText) {
 							appendTail(stdoutTrimmed ? `\n\n${visibleDisplayText}` : visibleDisplayText);
 						}
+						awaitingCellSeparator = true;
 					}
 
 					if (result.cancelled) {

@@ -129,6 +129,44 @@ describe("EvalTool live stdout streaming", () => {
 		expect(text).toBe("one\ntwo");
 	});
 
+	/**
+	 * Regression test for the cell-boundary separator fix: `appendTail` now
+	 * inserts `"\n\n"` between cells' streamed output to mirror
+	 * `cellOutputs.join("\n\n")` in the final result (see `eval.ts`'s
+	 * `awaitingCellSeparator`). `EvalTool.execute()`'s single public entrypoint
+	 * only ever runs one cell per call, so this pins the common (only
+	 * reachable) path: a lone cell's streamed tail must never gain a spurious
+	 * separator it didn't itself produce.
+	 */
+	it("never inserts a cell-boundary separator for a single-cell run", async () => {
+		const tailTexts: string[] = [];
+		vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation((async (
+			_code: string,
+			options: { onChunk?: (chunk: string) => void },
+		) => {
+			options.onChunk?.("solo");
+			return baseResult({ output: "solo" });
+		}) as never);
+
+		const tool = new EvalTool(makeSession());
+		const result = await tool.execute(
+			"call-single-cell",
+			{ language: "js", code: "process.stdout.write('solo')" },
+			undefined,
+			update => {
+				const text = update.content.find(c => c.type === "text")?.text;
+				if (typeof text === "string") tailTexts.push(text);
+			},
+		);
+
+		const finalTail = tailTexts.at(-1) ?? "";
+		expect(finalTail).toBe("solo");
+		expect(finalTail).not.toContain("\n\n");
+
+		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		expect(text).toBe("solo");
+	});
+
 	it("preserves the column-cap notice after rebuilding the final eval summary", async () => {
 		const settings = Settings.isolated();
 		settings.set("tools.outputMaxColumns", 8);
