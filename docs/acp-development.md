@@ -90,6 +90,10 @@ a `prompt` there usually fails with `RequestError: Internal error (code=-32603)`
 reporting a real auth failure, not a probe bug; use `--isolate` for handshake/session
 probing only, never for a `prompt` that needs to actually reach a model.
 
+For rules 7–9's boundary/regression classes specifically, `acp-probe stress-output
+<bytes>` and `acp-probe kill-mid-tool <text...>` exercise them directly against a real
+`omp acp` process instead of by hand — see acp-probe's README for both.
+
 Frame logs are the source of truth. Read the literal `content` array, `title`, and `kind`
 sent for the tool call you're working on before changing (or writing) any mapper code.
 
