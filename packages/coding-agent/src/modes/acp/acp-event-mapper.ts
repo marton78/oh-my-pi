@@ -924,9 +924,31 @@ function buildMetaTerminalDelta(
 	if (!delta) {
 		return undefined;
 	}
-	options.setMetaTerminalSent?.(toolCallId, prior + delta);
+	// `prior + delta` is the full logical history ever delivered to the
+	// client, which keeps growing across every roll of the producer's own
+	// bounded tail buffer (50 KB bash / 100 KB eval, see `DEFAULT_MAX_BYTES`)
+	// for as long as the command keeps streaming. Only the trailing
+	// `MAX_WATERMARK_BYTES` bytes are ever useful for the *next*
+	// `deliveredOverlap` call — a genuine overlap can never exceed the
+	// producer's own window — so retaining more than that is pure waste:
+	// unbounded memory, and quadratic CPU overall since `deliveredOverlap`'s
+	// KMP scan costs O(len(prior) + len(next)) on every update of a long,
+	// chatty command.
+	const watermark = prior + delta;
+	options.setMetaTerminalSent?.(
+		toolCallId,
+		watermark.length > MAX_WATERMARK_BYTES ? watermark.slice(watermark.length - MAX_WATERMARK_BYTES) : watermark,
+	);
 	return delta;
 }
+
+/**
+ * Generous headroom over the largest known producer tail-buffer window
+ * (`eval.ts`'s `TailBuffer(DEFAULT_MAX_BYTES * 2)`, i.e. 100 KB) — see
+ * `buildMetaTerminalDelta`'s watermark-growth comment for why anything past
+ * this is never useful for the next overlap computation.
+ */
+const MAX_WATERMARK_BYTES = 200_000;
 
 /**
  * Short label for the tool call's title/header, which a live-terminal-style
