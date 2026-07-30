@@ -32,14 +32,20 @@ log_dir="$(mktemp -d)"
 pass=0
 fail=0
 rows=()
+total=24
+n=0
 
 run_probe() {
 	# run_probe <label> <expect-exit> <probe-args...>
 	local label="$1" want="$2"
 	shift 2
+	n=$((n + 1))
+	printf '[%2d/%d] %-28s ' "$n" "$total" "$label"
+	local start=$SECONDS
 	local log="$log_dir/$label.log" out="$log_dir/$label.out"
 	(cd "$probe_dir" && bun run src/acp-probe.ts "$@" --timeout-ms 90000 --log "$log") >"$out" 2>&1
 	local code=$?
+	local elapsed=$((SECONDS - start))
 	local delivered
 	delivered=$(grep -o 'delivered=[0-9]*' "$out" | tail -1 | cut -d= -f2)
 	local status="OK"
@@ -49,6 +55,7 @@ run_probe() {
 	else
 		pass=$((pass + 1))
 	fi
+	printf '%2ds  exit=%s want=%s delivered=%-8s %s\n' "$elapsed" "$code" "$want" "${delivered:-  -}" "$status"
 	rows+=("$(printf '%-28s exit=%s want=%s delivered=%-8s %s' "$label" "$code" "$want" "${delivered:-  -}" "$status")")
 }
 
