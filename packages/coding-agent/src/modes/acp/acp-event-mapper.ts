@@ -1050,7 +1050,13 @@ function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
 	return blocks;
 }
 
-/** Join the per-file error messages from a partially-failed multi-file edit, skipping succeeded entries. */
+/**
+ * Join the per-file error messages from a partially-failed multi-file edit,
+ * skipping succeeded entries, followed by which files were never attempted
+ * (see `EditToolDetails.unattemptedPaths`) — mirrors the executor's own
+ * `Files NOT applied: ...` guidance line so the ACP display can tell a
+ * skipped-after-failure file apart from one that was never part of the edit.
+ */
 function extractEditFailureText(result: unknown): string | undefined {
 	if (typeof result !== "object" || result === null) return undefined;
 	const details = (result as { details?: unknown }).details;
@@ -1075,7 +1081,17 @@ function extractEditFailureText(result: unknown): string | undefined {
 		const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
 		lines.push(path ? `Error editing ${path}: ${message}` : message);
 	}
-	return lines.length > 0 ? lines.join("\n") : undefined;
+	if (lines.length === 0) return undefined;
+	const unattemptedPaths = "unattemptedPaths" in details ? details.unattemptedPaths : undefined;
+	if (Array.isArray(unattemptedPaths) && unattemptedPaths.length > 0) {
+		const paths = unattemptedPaths.filter((p): p is string => typeof p === "string" && p.length > 0);
+		if (paths.length > 0) {
+			lines.push(
+				`Files NOT applied: ${paths.join(", ")}; re-read the affected files and re-issue only the failed and unapplied files.`,
+			);
+		}
+	}
+	return lines.join("\n");
 }
 
 function buildDiffContent(entry: unknown): ToolCallContent | undefined {

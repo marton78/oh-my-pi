@@ -91,6 +91,8 @@ export interface EditToolDetails {
 	meta?: OutputMeta;
 	/** Per-file results (multi-file edits) */
 	perFileResults?: EditToolPerFileResult[];
+	/** Paths of files never attempted because an earlier file in the same multi-file edit failed first. */
+	unattemptedPaths?: string[];
 	/** Absolute file path for single-file edit results. Required by ACP diff metadata consumers. */
 	path?: string;
 	/** Source-of-truth content before the edit; `undefined` for create operations. */
