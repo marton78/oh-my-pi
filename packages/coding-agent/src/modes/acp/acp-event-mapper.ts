@@ -1362,7 +1362,16 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 			? nonTextContent
 			: [...nonTextContent, terminalToolCallContent(terminalId)];
 		const content = notices ? [...withTerminal, textToolCallContent(notices)] : withTerminal;
-		const directText = extractDirectText(value);
+		// `directText` (a framework-level `errorMessage`/`message`/`text` note,
+		// e.g. "Permission request cancelled") is the same class of fact as
+		// `notices` above and must be gated identically: a `terminalMetaCapable`
+		// client (Zed) drops every sibling `content` item on a terminal-bearing
+		// call (`has_terminals`), so appending it here would silently vanish for
+		// exactly the client this convention targets. `buildLiveTerminalNoticeMeta`
+		// carries it via `_meta.terminal_output` on the same terminal id instead
+		// for that case; only fall back to the sibling append for a client that
+		// hasn't negotiated that extension.
+		const directText = options.terminalMetaCapable ? undefined : extractDirectText(value);
 		if (!directText || hasEquivalentTextContent(content, directText)) {
 			return content;
 		}
@@ -1656,7 +1665,8 @@ function extractDetailsNotices(value: unknown): string | undefined {
  * Zed's `on_terminal_provider_event` (`agent_servers/acp.rs`) writes
  * `terminal_output` bytes straight into whatever terminal buffer already owns
  * that id — real or display-only — so this is a one-shot append of
- * `details.notices` onto the *same* terminal id the live command already
+ * `details.notices` plus any framework-level `directText` (e.g. "Permission
+ * request cancelled") onto the *same* terminal id the live command already
  * used, landing inside the same card the process output rendered in (and its
  * "Copy as Markdown" export) instead of a sibling `content` item Zed's
  * `has_terminals` gate would silently drop. Only ever called once, from
@@ -1678,8 +1688,10 @@ function buildLiveTerminalNoticeMeta(
 	const terminalId = extractTerminalId(value);
 	if (!terminalId || !(options.isTerminalLive?.(terminalId) ?? true)) return undefined;
 	const notices = extractDetailsNotices(value);
-	if (!notices) return undefined;
-	return { terminal_output: { terminal_id: terminalId, data: `\n${notices}\n` } };
+	const directText = extractDirectText(value);
+	const combined = [notices, directText].filter((t): t is string => !!t).join("\n\n");
+	if (!combined) return undefined;
+	return { terminal_output: { terminal_id: terminalId, data: `\n${combined}\n` } };
 }
 
 /**

@@ -1343,6 +1343,72 @@ describe("ACP event mapper", () => {
 		expect(update._meta).toBeUndefined();
 	});
 
+	it("delivers a framework-level directText note through _meta.terminal_output instead of dead sibling content", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4819042330 follow-up
+		// audit): `extractDirectText` (a top-level `errorMessage`/`message`/
+		// `text` framework note, e.g. "Permission request cancelled") was
+		// appended as sibling `content` in the live-terminal branch completely
+		// ungated — the same has_terminals class of bug already fixed for
+		// `details.notices`. No current producer sets both `terminalId` and a
+		// top-level `errorMessage` on the same result, but the gate must hold
+		// for whichever tool does next. Must ride via `_meta.terminal_output`
+		// on the same terminal id for a terminalMetaCapable client instead.
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-direct-text",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [],
+					details: { terminalId: "term-3" },
+					errorMessage: "Permission request cancelled",
+				},
+			} as unknown as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: unknown;
+			_meta?: { terminal_output?: { terminal_id: string; data: string } };
+		};
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-3" }]);
+		expect(update._meta?.terminal_output).toEqual({
+			terminal_id: "term-3",
+			data: "\nPermission request cancelled\n",
+		});
+	});
+
+	it("falls back to sibling content for a directText note when the client hasn't negotiated _meta.terminal_output", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-direct-text-no-meta",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [],
+					details: { terminalId: "term-4" },
+					errorMessage: "Permission request cancelled",
+				},
+			} as unknown as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: false },
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as { content?: unknown; _meta?: unknown };
+		expect(update.content).toEqual([
+			{ type: "terminal", terminalId: "term-4" },
+			{ type: "content", content: { type: "text", text: "Permission request cancelled" } },
+		]);
+		expect(update._meta).toBeUndefined();
+	});
+
 	it("renders recorded output as text when the terminal id is not live", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
