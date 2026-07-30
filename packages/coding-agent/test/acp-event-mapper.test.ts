@@ -1681,6 +1681,56 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("bounds the delivered watermark instead of growing it across every tail-buffer roll", () => {
+		// Regression test: once the producer's tail buffer starts rolling
+		// forward, `buildMetaTerminalDelta` stored `prior + delta` as the new
+		// watermark on every update — the *total* history ever delivered to
+		// the client, not the bounded producer window. That grows without
+		// bound for a long, chatty command, and `deliveredOverlap`'s KMP scan
+		// costs O(len(prior) + len(next)) per update, so it's both unbounded
+		// memory and effectively quadratic CPU across the command's lifetime.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		const lineSize = 500;
+		const windowLines = 20;
+		const totalLines = 600;
+		const allLines: string[] = [];
+		let maxWatermarkSeen = 0;
+		for (let i = 0; i < totalLines; i++) {
+			allLines.push(`line ${i} ${"y".repeat(lineSize)}`);
+			// Simulates the producer's own bounded tail buffer: only the most
+			// recent `windowLines` survive in each snapshot, so once the window
+			// fills, every later update is a genuine roll (drops the oldest
+			// line, gains a new one) rather than a plain extension.
+			const windowText = `${allLines.slice(-windowLines).join("\n")}\n`;
+			mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_update",
+					toolCallId: "tc-watermark-bound",
+					toolName: "bash",
+					args: { command: "a very noisy long-running command" },
+					partialResult: { content: [{ type: "text", text: windowText }], details: {} },
+				} as AgentSessionEvent,
+				"session-1",
+				options,
+			);
+			const stored = sent.get("tc-watermark-bound");
+			if (stored) maxWatermarkSeen = Math.max(maxWatermarkSeen, stored.length);
+		}
+		// 600 lines * ~510 bytes each ≈ 306,000 bytes streamed in total, far
+		// more than any single producer window — confirms rolling actually
+		// happened and the watermark grew past one window's worth of content.
+		expect(maxWatermarkSeen).toBeGreaterThan(windowLines * (lineSize + 10));
+		// ...but never past the bound, regardless of how long the command runs.
+		expect(maxWatermarkSeen).toBeLessThanOrEqual(200_000);
+	});
+
 	it("suppresses a snapshot with no overlap against delivered text instead of resending it whole", () => {
 		// No genuine overlap exists (the producer emitted something wholly
 		// unrelated to what's already on screen). Appending it whole would
