@@ -17,15 +17,44 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import {
+	type AcpEventMapperOptions,
 	buildToolCallStartUpdate,
 	deliveredOverlap,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
+import { checkAcpUpdateInvariants } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-update-invariants";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { formatOutputNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
+
+/**
+ * Every mapper call in this suite goes through here so the wire-level
+ * invariants (`docs/acp-development.md` rules 7 and 9) are checked on the
+ * frames this suite builds. The production chokepoint (`AcpAgent#sendUpdate`)
+ * sits one layer above the mapper, so without this wrapper the bulk of ACP
+ * frame coverage — every test that calls the mapper directly — validated only
+ * against the ACP JSON schema, which by design says nothing about Zed's
+ * renderer rules. That gap is how a `[terminal, text]` frame shipped while the
+ * guard that rejects it was landing in the same PR
+ * (oh-my-pi/oh-my-pi#7078 review 4821242767).
+ *
+ * The capability context is the mapper's own options, so a test can never
+ * assert one negotiation state while the check assumes another.
+ */
+function mapUpdates(
+	event: AgentSessionEvent,
+	sessionId: string,
+	options: AcpEventMapperOptions = {},
+): SessionNotification[] {
+	const updates = mapAgentSessionEventToAcpSessionUpdates(event, sessionId, options);
+	const context = { terminalMetaCapable: options.terminalMetaCapable === true };
+	for (const update of updates) {
+		expect(checkAcpUpdateInvariants(update, context)).toEqual([]);
+	}
+	return updates;
+}
 
 function makeAssistantMessage(text: string) {
 	return {
@@ -117,7 +146,7 @@ describe("ACP event mapper", () => {
 		const getMessageId = (message: unknown): string | undefined =>
 			message === assistantMessage ? "a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a" : undefined;
 
-		const textUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const textUpdates = mapUpdates(
 			{
 				type: "message_update",
 				message: assistantMessage,
@@ -126,7 +155,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			{ getMessageId },
 		);
-		const thoughtUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const thoughtUpdates = mapUpdates(
 			{
 				type: "message_update",
 				message: assistantMessage,
@@ -151,7 +180,7 @@ describe("ACP event mapper", () => {
 		const assistantMessage = makeAssistantMessage("final response");
 		const progress = { textEmitted: false, thoughtEmitted: false };
 
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "message_end",
 				message: assistantMessage,
@@ -181,7 +210,7 @@ describe("ACP event mapper", () => {
 			getMessageProgress: (message: unknown) => (message === assistantMessage ? progress : undefined),
 		};
 
-		const deltaUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const deltaUpdates = mapUpdates(
 			{
 				type: "message_update",
 				message: assistantMessage,
@@ -190,7 +219,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const doneUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const doneUpdates = mapUpdates(
 			{
 				type: "message_end",
 				message: assistantMessage,
@@ -205,7 +234,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("shows the command as the title without duplicating it in content", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-command-start",
@@ -248,7 +277,7 @@ describe("ACP event mapper", () => {
 		] satisfies AgentSessionEvent[];
 
 		const updates = events.flatMap(event =>
-			mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+			mapUpdates(event, "session-1", {
 				getToolArgs: () => ({ op: "send", to: "Scout", message: "Private coordination" }),
 			}),
 		);
@@ -278,7 +307,7 @@ describe("ACP event mapper", () => {
 		] satisfies AgentSessionEvent[];
 
 		const updates = events.flatMap(event =>
-			mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+			mapUpdates(event, "session-1", {
 				getToolArgs: () => args,
 			}),
 		);
@@ -287,7 +316,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps Hub process control visible over ACP", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-hub-process-send",
@@ -324,7 +353,7 @@ describe("ACP event mapper", () => {
 		] satisfies AgentSessionEvent[];
 
 		const updates = events.flatMap(event =>
-			mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+			mapUpdates(event, "session-1", {
 				getToolArgs: () => ({ op: "wait", ids: ["bash_a1b2c3"] }),
 			}),
 		);
@@ -333,7 +362,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps a bare Hub wait visible so job deliveries reach ACP", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-hub-bare-wait",
@@ -348,7 +377,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("hides a peer-scoped Hub wait from ACP", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-hub-peer-wait",
@@ -362,7 +391,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("uses raw command text for the title even when intent is generic", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-command-start-generic-intent",
@@ -381,7 +410,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("preserves eval source when a new eval tool is started", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-start",
@@ -414,7 +443,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("builds eval source content from valid cells only", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-mixed-cells",
@@ -439,7 +468,7 @@ describe("ACP event mapper", () => {
 
 	it("limits eval source before emitting visible tool-call content, keeping the title short", () => {
 		const source = "x".repeat(4_100);
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-long-source",
@@ -463,7 +492,7 @@ describe("ACP event mapper", () => {
 		expect(contentText?.endsWith("…")).toBe(true);
 	});
 	it("emits a diff ToolCallContent for each per-file edit result", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-1",
@@ -507,7 +536,7 @@ describe("ACP event mapper", () => {
 		// the `diffContent.length > 0` branch renders only the entries that
 		// still have a diff and the pruned file vanishes from ACP content
 		// entirely, even though it was edited successfully.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-pruned",
@@ -550,7 +579,7 @@ describe("ACP event mapper", () => {
 		// `extractPrunedEditPathsText` was never called from the `event.isError`
 		// branch, so a successfully-edited-but-pruned file disappeared from the
 		// card whenever the same multi-file edit also had an unrelated failure.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-pruned-partial-fail",
@@ -597,7 +626,7 @@ describe("ACP event mapper", () => {
 		// down with it whenever there was nothing to prune. Diagnostics on a
 		// successful edit must survive next to the diff.
 		const meta = { diagnostics: { summary: "1 warning", messages: ["a.ts:3: unused import"] } };
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-diagnostics",
@@ -642,7 +671,7 @@ describe("ACP event mapper", () => {
 		// every successful or partially-failed multi-file edit.
 		const metaA = { diagnostics: { summary: "1 warning", messages: ["a.ts:3: unused import"] } };
 		const metaB = { diagnostics: { summary: "1 error", messages: ["b.ts:5: undefined name"] } };
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-multi-file-diagnostics",
@@ -691,7 +720,7 @@ describe("ACP event mapper", () => {
 		// to report (the `extractReadableText` fallback path already included
 		// it, but that path is skipped once failure text exists).
 		const meta = { diagnostics: { summary: "1 warning", messages: ["a.ts:3: unused import"] } };
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-diagnostics-failure",
@@ -735,7 +764,7 @@ describe("ACP event mapper", () => {
 		// snapshotsPruned entries that also failed (isError) are covered by the
 		// error-branch's own failure text, not this note — an entry can't be
 		// both a silent success and a reported failure.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-pruned-error",
@@ -760,7 +789,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("emits a diff ToolCallContent for single-file edit details", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-single",
@@ -794,7 +823,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("drops the redundant text echo when a successful edit already has a diff", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-edit-no-echo",
@@ -817,7 +846,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps the text content when a partially-failed edit has no diff for the failed file", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-edit-partial-fail",
@@ -855,7 +884,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("does not duplicate a succeeded file's diff with its own ack text when a later file in the same edit fails", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-edit-partial-fail-multi-success",
@@ -914,7 +943,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps 'Files NOT applied' guidance for files never attempted after an earlier failure", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-edit-partial-fail-unattempted",
@@ -959,7 +988,7 @@ describe("ACP event mapper", () => {
 		// requires `perFileResults` and returned `undefined`, so this branch fell
 		// straight to `diffContent` alone, silently dropping the "entry N was NOT
 		// applied" guidance that only exists in the joined text echo.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-edit-single-path-aggregate-fail",
@@ -1008,7 +1037,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("includes the target file in the edit tool's title for every edit mode", () => {
-		const pathStart = mapAgentSessionEventToAcpSessionUpdates(
+		const pathStart = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-edit-title-path",
@@ -1018,7 +1047,7 @@ describe("ACP event mapper", () => {
 			} as AgentSessionEvent,
 			"session-1",
 		);
-		const hashlineStart = mapAgentSessionEventToAcpSessionUpdates(
+		const hashlineStart = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-edit-title-hashline",
@@ -1027,7 +1056,7 @@ describe("ACP event mapper", () => {
 			} as AgentSessionEvent,
 			"session-1",
 		);
-		const applyPatchStart = mapAgentSessionEventToAcpSessionUpdates(
+		const applyPatchStart = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-edit-title-apply-patch",
@@ -1070,7 +1099,7 @@ describe("ACP event mapper", () => {
 		];
 
 		for (const event of events) {
-			const updates = mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+			const updates = mapUpdates(event, "session-1", {
 				resolveImageData: data => (data === blobRef ? resolvedImageData : data),
 			});
 			const update = updates[0]!.update as {
@@ -1091,7 +1120,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("emits locations on tool_execution_update from args", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-2",
@@ -1110,7 +1139,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("shows only the live terminal for a command tool update, dropping the command echo", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-3",
@@ -1129,7 +1158,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("shows only the live terminal when details accompany empty content", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-terminal-empty-content",
@@ -1148,7 +1177,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("drops raw output text once a live terminal already shows it", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-terminal-update-text",
@@ -1170,7 +1199,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("drops raw end-result text once a live terminal already shows it", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-end",
@@ -1192,7 +1221,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("shows only the live terminal for a command tool's final update", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-final-command",
@@ -1218,7 +1247,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps terminal content alongside readable error and message fields", () => {
-		const errorUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const errorUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-error",
@@ -1228,7 +1257,7 @@ describe("ACP event mapper", () => {
 			} as AgentSessionEvent,
 			"session-1",
 		);
-		const messageUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const messageUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-message",
@@ -1263,7 +1292,7 @@ describe("ACP event mapper", () => {
 
 	it("widens the fence past backtick runs the output already contains", () => {
 		const fenceUpdates = (output: string) =>
-			mapAgentSessionEventToAcpSessionUpdates(
+			mapUpdates(
 				{
 					type: "tool_execution_end",
 					toolCallId: "tc-fence-widen",
@@ -1292,7 +1321,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps a framework error note beside fenced output without a terminal", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-no-terminal-error",
@@ -1325,7 +1354,7 @@ describe("ACP event mapper", () => {
 		// Notices must instead ride as extra `_meta.terminal_output` bytes on
 		// the same real terminal id, which Zed's `on_terminal_provider_event`
 		// appends straight into that terminal's own buffer.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-notices",
@@ -1367,7 +1396,7 @@ describe("ACP event mapper", () => {
 		// silently dropped entirely rather than falling back to the
 		// best-effort sibling `content` item a spec-compliant (non-Zed) client
 		// might still render.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-notices-no-meta",
@@ -1406,7 +1435,7 @@ describe("ACP event mapper", () => {
 		// top-level `errorMessage` on the same result, but the gate must hold
 		// for whichever tool does next. Must ride via `_meta.terminal_output`
 		// on the same terminal id for a terminalMetaCapable client instead.
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-direct-text",
@@ -1436,7 +1465,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("falls back to sibling content for a directText note when the client hasn't negotiated _meta.terminal_output", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-direct-text-no-meta",
@@ -1463,7 +1492,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("renders recorded output as text when the terminal id is not live", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-stale",
@@ -1485,7 +1514,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("uses the meta-terminal convention for a stale replay terminal id when the client supports it", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-stale-meta",
@@ -1517,7 +1546,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("does not use the meta-terminal convention when a real client terminal is available", () => {
-		const start = mapAgentSessionEventToAcpSessionUpdates(
+		const start = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-real-terminal",
@@ -1543,7 +1572,7 @@ describe("ACP event mapper", () => {
 		// to key purely off `realTerminalCapable`, so a pty call fell back to
 		// the fenced-text path and was capped at `ACP_TEXT_LIMIT` even on a
 		// terminalMetaCapable client that could render it untruncated.
-		const start = mapAgentSessionEventToAcpSessionUpdates(
+		const start = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-pty",
@@ -1556,7 +1585,7 @@ describe("ACP event mapper", () => {
 		expect(start.content).toEqual([{ type: "terminal", terminalId: "tc-pty" }]);
 		expect(start._meta).toEqual({ terminal_info: { terminal_id: "tc-pty" } });
 
-		const end = mapAgentSessionEventToAcpSessionUpdates(
+		const end = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-pty",
@@ -1575,7 +1604,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("does not route a non-pty bash call through the meta terminal when a real client terminal is available", () => {
-		const start = mapAgentSessionEventToAcpSessionUpdates(
+		const start = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-non-pty",
@@ -1590,7 +1619,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("registers a meta terminal on eval start and reports output/exit at the end", () => {
-		const startUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const startUpdates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-meta",
@@ -1610,7 +1639,7 @@ describe("ACP event mapper", () => {
 		expect(start.content).toEqual([{ type: "terminal", terminalId: "tc-eval-meta" }]);
 		expect(start._meta).toEqual({ terminal_info: { terminal_id: "tc-eval-meta", cwd: "/repo" } });
 
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-eval-meta",
@@ -1640,7 +1669,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("keeps each cell's own [lang] title label in a multi-cell eval's meta-terminal source echo", () => {
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-eval-multi-cell-meta",
@@ -1682,7 +1711,7 @@ describe("ACP event mapper", () => {
 		// drop the terminal item from this final update whenever the result
 		// actually produced an image.
 		const imageData = "base64-image-data";
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-eval-image",
@@ -1729,7 +1758,7 @@ describe("ACP event mapper", () => {
 		// so never exercised this — the real path lost every eval image once a
 		// client advertised `_meta.terminal_output`.
 		const imageData = "base64-image-data-2";
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-eval-image-no-details",
@@ -1760,7 +1789,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("streams cumulative output through the meta-terminal convention on tool_execution_update", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-eval-progress",
@@ -1804,7 +1833,7 @@ describe("ACP event mapper", () => {
 				sent.set(id, text);
 			},
 		};
-		const updateUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const updateUpdates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-eval-delta",
@@ -1820,7 +1849,7 @@ describe("ACP event mapper", () => {
 			terminal_output: { terminal_id: "tc-eval-delta", data: `print('hi')\n${"─".repeat(48)}\nhi` },
 		});
 
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-eval-delta",
@@ -1862,7 +1891,7 @@ describe("ACP event mapper", () => {
 		let delivered = "";
 		for (let i = 0; i < 20; i++) {
 			raw += `line ${i} ${"y".repeat(500)}\n`;
-			const updates = mapAgentSessionEventToAcpSessionUpdates(
+			const updates = mapUpdates(
 				{
 					type: "tool_execution_update",
 					toolCallId: "tc-eval-large",
@@ -1878,7 +1907,7 @@ describe("ACP event mapper", () => {
 			if (data) delivered += data;
 		}
 		expect(raw.length).toBeGreaterThan(4000);
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-eval-large",
@@ -1913,7 +1942,7 @@ describe("ACP event mapper", () => {
 				sent.set(id, text);
 			},
 		};
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-roll",
@@ -1924,7 +1953,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const rolled = mapAgentSessionEventToAcpSessionUpdates(
+		const rolled = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-roll",
@@ -1963,7 +1992,7 @@ describe("ACP event mapper", () => {
 		const droppedPrefix = `${lines.slice(0, 10).join("\n")}\n`;
 		const overlap = full.slice(droppedPrefix.length);
 		expect(overlap.length).toBeGreaterThan(4096);
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-big-roll",
@@ -1974,7 +2003,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const rolled = mapAgentSessionEventToAcpSessionUpdates(
+		const rolled = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-big-roll",
@@ -2013,7 +2042,7 @@ describe("ACP event mapper", () => {
 			},
 		};
 		const raw = "A".repeat(30000);
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-column-truncated",
@@ -2025,7 +2054,7 @@ describe("ACP event mapper", () => {
 			options,
 		);
 		const rendered = `${"A".repeat(768)}…`;
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-column-truncated",
@@ -2061,7 +2090,7 @@ describe("ACP event mapper", () => {
 			},
 		};
 		const raw = "A".repeat(30000);
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-bash-column-truncated",
@@ -2073,7 +2102,7 @@ describe("ACP event mapper", () => {
 			options,
 		);
 		const rendered = `${"A".repeat(768)}…\n\nWall time: 0.02 seconds\n\n[Some lines truncated to 768 chars]`;
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-bash-column-truncated",
@@ -2117,7 +2146,7 @@ describe("ACP event mapper", () => {
 				sent.set(id, text);
 			},
 		};
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-trimmed",
@@ -2128,7 +2157,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-trimmed",
@@ -2161,7 +2190,7 @@ describe("ACP event mapper", () => {
 				sent.set(id, text);
 			},
 		};
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-elided",
@@ -2172,7 +2201,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const endUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-elided",
@@ -2287,7 +2316,7 @@ describe("ACP event mapper", () => {
 				// Simulates a bounded producer tail buffer: only the most recent
 				// `windowSize` chars survive in the snapshot the mapper sees.
 				const window = trueOutput.length > windowSize ? trueOutput.slice(-windowSize) : trueOutput;
-				const updates = mapAgentSessionEventToAcpSessionUpdates(
+				const updates = mapUpdates(
 					{
 						type: "tool_execution_update",
 						toolCallId,
@@ -2334,7 +2363,7 @@ describe("ACP event mapper", () => {
 			// fills, every later update is a genuine roll (drops the oldest
 			// line, gains a new one) rather than a plain extension.
 			const windowText = `${allLines.slice(-windowLines).join("\n")}\n`;
-			mapAgentSessionEventToAcpSessionUpdates(
+			mapUpdates(
 				{
 					type: "tool_execution_update",
 					toolCallId: "tc-watermark-bound",
@@ -2375,7 +2404,7 @@ describe("ACP event mapper", () => {
 				sent.set(id, text);
 			},
 		};
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-diverge",
@@ -2386,7 +2415,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const diverged = mapAgentSessionEventToAcpSessionUpdates(
+		const diverged = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-diverge",
@@ -2408,7 +2437,7 @@ describe("ACP event mapper", () => {
 		// The watermark must now track the resynced snapshot, not the stale
 		// pre-rollover one — a later snapshot that genuinely extends it resumes
 		// delivering plain deltas instead of diverging (and resyncing) again.
-		const resumed = mapAgentSessionEventToAcpSessionUpdates(
+		const resumed = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-diverge",
@@ -2446,7 +2475,7 @@ describe("ACP event mapper", () => {
 				sent.set(id, text);
 			},
 		};
-		mapAgentSessionEventToAcpSessionUpdates(
+		mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-nul",
@@ -2457,7 +2486,7 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const update = mapAgentSessionEventToAcpSessionUpdates(
+		const update = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-nul",
@@ -2477,7 +2506,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("emits no meta-terminal output on tool_execution_update when there is no partial output yet", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_update",
 				toolCallId: "tc-eval-progress-empty",
@@ -2493,7 +2522,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("never uses the meta-terminal convention when the client didn't advertise it", () => {
-		const start = mapAgentSessionEventToAcpSessionUpdates(
+		const start = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-no-meta",
@@ -2509,7 +2538,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("reports a captured non-zero exit code through the meta-terminal convention", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-exit-code",
@@ -2531,7 +2560,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("fences plain command output visible without terminal details", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-plain-output",
@@ -2554,7 +2583,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("embeds only terminal content from direct terminalId", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-direct-terminal",
@@ -2574,7 +2603,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("does not duplicate existing terminal content", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-terminal-dedup",
@@ -2596,7 +2625,7 @@ describe("ACP event mapper", () => {
 		expect(update.content?.filter(item => item.type === "terminal" && item.terminalId === "term-1")).toHaveLength(1);
 	});
 	it("shows the raw command as the title of a pending bash tool call, without content", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "toolu_bash_1",
@@ -2628,7 +2657,7 @@ describe("ACP event mapper", () => {
 
 	it("maps shell and exec tool starts as execute", () => {
 		for (const toolName of ["shell", "exec"] as const) {
-			const updates = mapAgentSessionEventToAcpSessionUpdates(
+			const updates = mapUpdates(
 				{
 					type: "tool_execution_start",
 					toolCallId: `toolu_${toolName}_1`,
@@ -2652,7 +2681,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("code-fences read/grep/write output but leaves web_search prose unfenced", () => {
-		const readUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const readUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-read-fence",
@@ -2662,7 +2691,7 @@ describe("ACP event mapper", () => {
 			} as AgentSessionEvent,
 			"session-1",
 		);
-		const grepUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const grepUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-grep-fence",
@@ -2672,7 +2701,7 @@ describe("ACP event mapper", () => {
 			} as AgentSessionEvent,
 			"session-1",
 		);
-		const writeUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const writeUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-write-fence",
@@ -2682,7 +2711,7 @@ describe("ACP event mapper", () => {
 			} as AgentSessionEvent,
 			"session-1",
 		);
-		const webSearchUpdates = mapAgentSessionEventToAcpSessionUpdates(
+		const webSearchUpdates = mapUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId: "tc-web-search-no-fence",
@@ -2892,7 +2921,7 @@ describe("ACP event mapper", () => {
 		expect("content" in update).toBe(false);
 	});
 	it("does not add command text content to non-command tool starts", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "toolu_read_1",
@@ -2920,7 +2949,7 @@ describe("ACP event mapper", () => {
 		expect("content" in update).toBe(false);
 	});
 	it("resolves tool_execution_start locations against mapper cwd", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "toolu_read_cwd",
@@ -2939,7 +2968,7 @@ describe("ACP event mapper", () => {
 		expect("content" in update).toBe(false);
 	});
 	it("emits distinct locations for move-style path arguments", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+		const updates = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-move",
@@ -2996,7 +3025,7 @@ describe("ACP event mapper", () => {
 	});
 
 	it("rejects mutated ACP notification discriminators", () => {
-		const [notification] = mapAgentSessionEventToAcpSessionUpdates(
+		const [notification] = mapUpdates(
 			{
 				type: "tool_execution_start",
 				toolCallId: "tc-schema",
