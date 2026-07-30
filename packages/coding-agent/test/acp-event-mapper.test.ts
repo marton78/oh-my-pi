@@ -1323,12 +1323,15 @@ describe("ACP event mapper", () => {
 		});
 	});
 
-	it("preserves eval-cell images alongside the meta-terminal content block", () => {
-		// Regression test: the meta-terminal branch unconditionally replaced
-		// `content` with just the terminal reference, discarding any
-		// `display()`-produced image eval carries in `details.images`. The
-		// terminal can only render the text byte stream — binary content has
-		// nowhere else to go and must ride alongside it, not be dropped.
+	it("routes eval images through a plain content card instead of the terminal-only one", () => {
+		// Regression test, round 3 of the same finding: Zed's `has_terminals`
+		// drops *every* sibling `content` item once a `terminal` item exists —
+		// not just text (see `docs/acp-development.md`'s "Do" rule). Images
+		// have no `_meta.terminal_output`-style byte-stream equivalent either
+		// (that channel is text-only), so a terminal box that hides the image
+		// is strictly worse than a plain content card that shows everything:
+		// drop the terminal item from this final update whenever the result
+		// actually produced an image.
 		const imageData = "base64-image-data";
 		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -1351,16 +1354,24 @@ describe("ACP event mapper", () => {
 			content?: Array<{
 				type: string;
 				terminalId?: string;
-				content?: { type: string; data?: string; mimeType?: string };
+				content?: { type: string; text?: string; data?: string; mimeType?: string };
 			}>;
+			_meta?: Record<string, unknown>;
 		};
 		expect(end.content).toEqual([
-			{ type: "terminal", terminalId: "tc-eval-image" },
+			{ type: "content", content: { type: "text", text: "```\n(displayed 1 image; no text output)\n```" } },
 			{ type: "content", content: { type: "image", data: imageData, mimeType: "image/png" } },
 		]);
+		// The display-only terminal Zed registered at `tool_execution_start`
+		// still needs its lifecycle finalized even though it's no longer
+		// referenced by this update's `content` — just no `terminal_output`,
+		// since there's no terminal card left to append bytes into.
+		expect(end._meta).toEqual({
+			terminal_exit: { terminal_id: "tc-eval-image", exit_code: 0, signal: null },
+		});
 	});
 
-	it("preserves eval-cell images when details.images is absent (real EvalTool result shape)", () => {
+	it("routes eval images through a plain content card when details.images is absent (real EvalTool result shape)", () => {
 		// Regression test: `EvalTool.execute`'s actual final `toolResult(details)`
 		// only ever puts images in `.content([{type:"text",...}, ...images])` —
 		// `details.images` is populated solely on the intermediate streaming
@@ -1390,11 +1401,11 @@ describe("ACP event mapper", () => {
 			content?: Array<{
 				type: string;
 				terminalId?: string;
-				content?: { type: string; data?: string; mimeType?: string };
+				content?: { type: string; text?: string; data?: string; mimeType?: string };
 			}>;
 		};
 		expect(end.content).toEqual([
-			{ type: "terminal", terminalId: "tc-eval-image-no-details" },
+			{ type: "content", content: { type: "text", text: "```\n(displayed 1 image; no text output)\n```" } },
 			{ type: "content", content: { type: "image", data: imageData, mimeType: "image/png" } },
 		]);
 	});

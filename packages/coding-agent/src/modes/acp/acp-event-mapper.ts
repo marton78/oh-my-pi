@@ -340,34 +340,56 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				rawOutput: event.result,
 			};
 			if (wantsMetaTerminal(event.toolName, options)) {
-				// No live client-owned terminal exists for this call (see
-				// `wantsMetaTerminal`), so report the final output through the
-				// display-only terminal `_meta` convention instead of a fenced
-				// text block — matches `claude-agent-acp`'s `terminal_output`/
-				// `terminal_exit` shape, and (unlike a live terminal id) survives
-				// `session/load` replay verbatim since it carries no client-owned
-				// resource reference.
-				// The terminal block itself can't render binary content (an eval
-				// cell's `display()`ed image lands in `details.images`, not the raw
-				// output stream) — Zed's `has_terminals` routes any tool call
-				// carrying a `terminal` item exclusively through the terminal
-				// renderer, but that only concerns *text* duplication; images are
-				// otherwise unrepresented and must ride alongside it, not be
-				// dropped for it.
-				update.content = [
-					terminalToolCallContent(event.toolCallId),
-					...extractMetaTerminalImageToolCallContent(event.result, options),
-				];
+				const images = extractMetaTerminalImageToolCallContent(event.result, options);
 				const finalOutput = extractTerminalStreamText(event.result) ?? extractReadableText(event.result) ?? "";
-				const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
-				update._meta = {
-					...(delta !== undefined ? { terminal_output: { terminal_id: event.toolCallId, data: delta } } : {}),
-					terminal_exit: {
-						terminal_id: event.toolCallId,
-						exit_code: extractExitCode(event.result, event.isError),
-						signal: null,
-					},
-				};
+				if (images.length > 0) {
+					// Images can't ride alongside the terminal item either: Zed's
+					// `has_terminals` (`thread_view.rs`) renders a terminal-bearing
+					// tool call *exclusively* through the terminal card, dropping
+					// every sibling `content` item unconditionally — not just text
+					// (see `docs/acp-development.md`'s "Do" rule on this). Unlike
+					// text, an image has no terminal-byte-stream equivalent to ride
+					// via `_meta.terminal_output` either. A terminal box that hides
+					// the image is strictly worse than a plain content card that
+					// shows everything, so drop the terminal item from this final
+					// update and fall back to ordinary content (fenced text +
+					// images) whenever the result actually produced one.
+					const codeFence = shouldCodeFenceToolOutput(event.toolName);
+					update.content = [
+						...(finalOutput ? [textToolCallContent(codeFence ? fenceCodeBlock(finalOutput) : finalOutput)] : []),
+						...images,
+					];
+					// The display-only terminal entity Zed registered at
+					// `tool_execution_start` is independent of whether this
+					// update's `content` still references it — finalize its
+					// lifecycle so it doesn't linger as permanently "running" in
+					// Zed's own bookkeeping, even though it's no longer shown.
+					update._meta = {
+						terminal_exit: {
+							terminal_id: event.toolCallId,
+							exit_code: extractExitCode(event.result, event.isError),
+							signal: null,
+						},
+					};
+				} else {
+					// No live client-owned terminal exists for this call (see
+					// `wantsMetaTerminal`), so report the final output through the
+					// display-only terminal `_meta` convention instead of a fenced
+					// text block — matches `claude-agent-acp`'s `terminal_output`/
+					// `terminal_exit` shape, and (unlike a live terminal id) survives
+					// `session/load` replay verbatim since it carries no client-owned
+					// resource reference.
+					update.content = [terminalToolCallContent(event.toolCallId)];
+					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
+					update._meta = {
+						...(delta !== undefined ? { terminal_output: { terminal_id: event.toolCallId, data: delta } } : {}),
+						terminal_exit: {
+							terminal_id: event.toolCallId,
+							exit_code: extractExitCode(event.result, event.isError),
+							signal: null,
+						},
+					};
+				}
 			} else {
 				const codeFence = shouldCodeFenceToolOutput(event.toolName);
 				const diffContent = extractDiffToolCallContent(event.result);
