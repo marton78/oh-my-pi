@@ -7,6 +7,7 @@ import type {
 	ToolKind,
 } from "@agentclientprotocol/sdk";
 import { logger } from "@oh-my-pi/pi-utils";
+import { parseEditTargetPath } from "../../edit";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveToCwd } from "../../tools/path-utils";
@@ -1023,8 +1024,10 @@ function buildToolTitle(toolName: string, args: unknown, intent: string | undefi
 		// modes) or is embedded in the `input` payload (hashline header / apply_patch
 		// marker) — neither is caught by the generic path/command/pattern/query
 		// subject fallback below, so a bare "edit" title (or the description alone,
-		// with no file name at all) was all a client had to show.
-		const editPath = extractEditPath(args);
+		// with no file name at all) was all a client had to show. Shared with the
+		// approval-prompt path in `src/edit/index.ts` so a future edit-syntax change
+		// can't make the two resolve different paths.
+		const editPath = parseEditTargetPath(args);
 		if (editPath) {
 			return trimmedIntent ? `${trimmedIntent} — ${editPath}` : `Edit ${editPath}`;
 		}
@@ -1632,28 +1635,6 @@ function hasBinaryContentBlock(blocks: unknown[]): boolean {
 		const type = getContentType(block);
 		return type === "image" || type === "audio";
 	});
-}
-
-/**
- * The edit tool's target file path: a top-level `path` arg for patch/replace
- * modes, or embedded in the `input` payload for hashline (`[path#TAG]`
- * header) / apply_patch (`*** Update File: path`) modes. Mirrors
- * `extractApprovalPath` in `src/edit/index.ts` — kept local (rather than
- * imported) since that helper returns the sentinel `"(unknown)"` for the
- * approval-prompt use case, not `undefined`.
- */
-function extractEditPath(args: unknown): string | undefined {
-	if (typeof args !== "object" || args === null) {
-		return undefined;
-	}
-	const input = extractStringProperty<{ input?: unknown }>(args, "input");
-	if (input) {
-		const hashlineMatch = /^\[([^#\r\n]+)(?:#[0-9a-fA-F]{4})?\]/m.exec(input);
-		if (hashlineMatch?.[1]) return hashlineMatch[1];
-		const applyPatchMatch = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/m.exec(input);
-		if (applyPatchMatch?.[1]) return applyPatchMatch[1].trim();
-	}
-	return extractStringProperty<PathContainer>(args, "path");
 }
 
 function extractStringProperty<T extends object>(value: unknown, key: keyof T): string | undefined {

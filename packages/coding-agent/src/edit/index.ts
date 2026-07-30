@@ -363,7 +363,14 @@ async function executeSinglePathEntries(
 	};
 }
 
-function extractApprovalPath(args: unknown): string {
+/**
+ * The edit tool's target file path: a top-level `path` arg for patch/replace
+ * modes, or embedded in the `input` payload for hashline (`[path#TAG]`
+ * header) / apply_patch (`*** Update File: path`) modes. Returns `undefined`
+ * when no path can be resolved; callers needing a display fallback (e.g.
+ * `extractApprovalPath`'s `"(unknown)"`) add their own sentinel.
+ */
+export function parseEditTargetPath(args: unknown): string | undefined {
 	const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
 	const input = typeof record.input === "string" ? record.input : undefined;
 	if (input) {
@@ -375,16 +382,16 @@ function extractApprovalPath(args: unknown): string {
 	}
 
 	const targetPath = record.path;
-	return typeof targetPath === "string" && targetPath.length > 0 ? targetPath : "(unknown)";
+	return typeof targetPath === "string" && targetPath.length > 0 ? targetPath : undefined;
 }
 
 export class EditTool implements AgentTool<TInput> {
 	readonly approval = (args: unknown) => {
-		const targetPath = extractApprovalPath(args);
-		return targetPath !== "(unknown)" && isInternalUrlPath(targetPath) ? "read" : "write";
+		const targetPath = parseEditTargetPath(args);
+		return targetPath !== undefined && isInternalUrlPath(targetPath) ? "read" : "write";
 	};
 	readonly formatApprovalDetails = (args: unknown): string[] => [
-		`File: ${truncateForPrompt(extractApprovalPath(args))}`,
+		`File: ${truncateForPrompt(parseEditTargetPath(args) ?? "(unknown)")}`,
 	];
 	readonly name = "edit";
 	readonly label = "Edit";
