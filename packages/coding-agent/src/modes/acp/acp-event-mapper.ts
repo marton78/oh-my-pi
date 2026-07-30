@@ -941,13 +941,26 @@ function buildMetaTerminalDelta(
 	}
 	const overlap = deliveredOverlap(prior, cumulativeOutput);
 	if (overlap === 0) {
-		logger.warn("ACP terminal output snapshot diverged from delivered text; suppressing", {
+		// A verbose command can emit more than one producer tail-buffer window
+		// (50 KB bash / 100 KB eval) between two updates, so the retained tail
+		// rolled forward with zero bytes shared against `prior` — this is a
+		// recoverable rollover, not a corrupted snapshot. Returning `undefined`
+		// here without moving the watermark would freeze the meta terminal at
+		// its first window forever: every later snapshot keeps diverging from
+		// the same stale `prior`, so the overlap stays 0 on every subsequent
+		// call too, silently dropping the final output and exit/truncation
+		// notices along with it. Resync instead: emit an explicit discontinuity
+		// notice plus the entire current tail (none of it overlaps what was
+		// already delivered), and reset the watermark to it so the next call's
+		// overlap scan has real, current data to compare against.
+		logger.warn("ACP terminal output snapshot rolled over with no overlap; resyncing", {
 			toolCallId,
 			toolName,
 			deliveredBytes: prior.length,
 			snapshotBytes: cumulativeOutput.length,
 		});
-		return undefined;
+		options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
+		return `\n[terminal output discontinuity: earlier bytes were dropped]\n${cumulativeOutput}`;
 	}
 	const delta = cumulativeOutput.slice(overlap);
 	if (!delta) {

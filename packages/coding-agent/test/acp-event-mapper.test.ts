@@ -1933,11 +1933,17 @@ describe("ACP event mapper", () => {
 		expect(maxWatermarkSeen).toBeLessThanOrEqual(200_000);
 	});
 
-	it("suppresses a snapshot with no overlap against delivered text instead of resending it whole", () => {
-		// No genuine overlap exists (the producer emitted something wholly
-		// unrelated to what's already on screen). Appending it whole would
-		// duplicate/corrupt the append-only terminal; the correct behavior is
-		// to drop it rather than resend already-delivered bytes plus garbage.
+	it("resyncs with a discontinuity notice on a non-overlapping tail rollover instead of freezing", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4819845316): no genuine
+		// overlap exists between the delivered watermark and the new snapshot —
+		// a verbose command outrunning the producer's own tail-buffer window
+		// between two updates is a real, recoverable case, not corruption. The
+		// old behavior returned `undefined` without moving the watermark, which
+		// freezes the meta terminal forever: every later snapshot keeps
+		// diverging from the same stale watermark. The fix must emit a
+		// discontinuity notice plus the whole new tail, and advance the
+		// watermark so a later, genuinely overlapping snapshot resumes
+		// delivering deltas instead of staying suppressed.
 		const sent = new Map<string, string>();
 		const options = {
 			terminalMetaCapable: true,
@@ -1968,8 +1974,35 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		);
-		const update = diverged[0]!.update as { _meta?: Record<string, unknown> };
-		expect(update._meta).toBeUndefined();
+		const update = diverged[0]!.update as {
+			_meta?: { terminal_output?: { terminal_id: string; data: string } };
+		};
+		expect(update._meta?.terminal_output).toEqual({
+			terminal_id: "tc-diverge",
+			data: "\n[terminal output discontinuity: earlier bytes were dropped]\nzzz completely unrelated",
+		});
+
+		// The watermark must now track the resynced snapshot, not the stale
+		// pre-rollover one — a later snapshot that genuinely extends it resumes
+		// delivering plain deltas instead of diverging (and resyncing) again.
+		const resumed = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-diverge",
+				toolName: "bash",
+				args: { command: "echo hi" },
+				partialResult: { content: [{ type: "text", text: "zzz completely unrelated MORE" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const resumedUpdate = resumed[0]!.update as {
+			_meta?: { terminal_output?: { terminal_id: string; data: string } };
+		};
+		expect(resumedUpdate._meta?.terminal_output).toEqual({
+			terminal_id: "tc-diverge",
+			data: " MORE",
+		});
 	});
 
 	it("computes overlap correctly when both strings contain a literal NUL byte", () => {
@@ -2012,9 +2045,12 @@ describe("ACP event mapper", () => {
 			"session-1",
 			options,
 		).at(0)!.update as { _meta?: { terminal_output?: { terminal_id: string; data: string } } };
-		// No real overlap between "a" and "\0a": the sentinel-free scan must
-		// report 0, not a corrupted (over-sliced) delta.
-		expect(update._meta).toBeUndefined();
+		// No real overlap between "a" and "\0a": must resync with the whole new
+		// tail via the discontinuity path, never a corrupted (over-sliced) delta.
+		expect(update._meta?.terminal_output).toEqual({
+			terminal_id: "tc-nul",
+			data: "\n[terminal output discontinuity: earlier bytes were dropped]\n\u0000a",
+		});
 	});
 
 	it("emits no meta-terminal output on tool_execution_update when there is no partial output yet", () => {
