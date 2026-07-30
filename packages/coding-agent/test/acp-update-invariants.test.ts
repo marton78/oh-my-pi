@@ -1,0 +1,82 @@
+import { describe, expect, it } from "bun:test";
+import type { SessionNotification } from "@agentclientprotocol/sdk";
+import { checkAcpUpdateInvariants } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-update-invariants";
+
+function toolCallUpdate(fields: Partial<SessionNotification["update"]>): SessionNotification {
+	return {
+		sessionId: "session-1",
+		update: {
+			sessionUpdate: "tool_call_update",
+			toolCallId: "call-1",
+			...fields,
+		} as SessionNotification["update"],
+	};
+}
+
+describe("checkAcpUpdateInvariants", () => {
+	it("flags a terminal item sent alongside sibling content (rule 7)", () => {
+		const notification = toolCallUpdate({
+			content: [
+				{ type: "terminal", terminalId: "term-1" },
+				{ type: "content", content: { type: "text", text: "exit code 0" } },
+			],
+		});
+
+		const violations = checkAcpUpdateInvariants(notification, { terminalMetaCapable: true });
+
+		expect(violations).toHaveLength(1);
+		expect(violations[0]).toContain("call-1");
+		expect(violations[0]).toContain("terminal item(s) [term-1]");
+	});
+
+	it("allows a terminal item with no siblings", () => {
+		const notification = toolCallUpdate({ content: [{ type: "terminal", terminalId: "term-1" }] });
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: true })).toEqual([]);
+	});
+
+	it("allows non-terminal content of any length", () => {
+		const notification = toolCallUpdate({
+			content: [
+				{ type: "content", content: { type: "text", text: "a" } },
+				{ type: "content", content: { type: "text", text: "b" } },
+			],
+		});
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: true })).toEqual([]);
+	});
+
+	it("flags _meta.terminal_output when the client never negotiated the capability (rule 9)", () => {
+		const notification = toolCallUpdate({
+			_meta: { terminal_output: { terminal_id: "call-1", data: "hi" } },
+		});
+
+		const violations = checkAcpUpdateInvariants(notification, { terminalMetaCapable: false });
+
+		expect(violations).toHaveLength(1);
+		expect(violations[0]).toContain("terminal_output");
+	});
+
+	it("allows _meta.terminal_* once the capability is negotiated", () => {
+		const notification = toolCallUpdate({
+			_meta: { terminal_exit: { terminal_id: "call-1", exit_code: 0, signal: null } },
+		});
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: true })).toEqual([]);
+	});
+
+	it("ignores non-terminal _meta keys regardless of capability", () => {
+		const notification = toolCallUpdate({ _meta: { some_other_extension: true } });
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: false })).toEqual([]);
+	});
+
+	it("ignores session updates that aren't tool calls", () => {
+		const notification: SessionNotification = {
+			sessionId: "session-1",
+			update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } },
+		};
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: false })).toEqual([]);
+	});
+});
