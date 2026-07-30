@@ -543,6 +543,50 @@ describe("ACP event mapper", () => {
 		expect(textBlocks[0]?.content?.text).toBe("```\nAlso applied (diff omitted: file snapshot too large): b.ts\n```");
 	});
 
+	it("names successfully-edited files whose snapshot was pruned even on a partial failure", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4819042330): the fix
+		// above only reached the `!event.isError` success branch —
+		// `extractPrunedEditPathsText` was never called from the `event.isError`
+		// branch, so a successfully-edited-but-pruned file disappeared from the
+		// card whenever the same multi-file edit also had an unrelated failure.
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-pruned-partial-fail",
+				toolName: "edit",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts\nUpdated b.ts\nError editing c.ts: boom" }],
+					details: {
+						perFileResults: [
+							{ path: "a.ts", diff: "...", oldText: "before-a\n", newText: "after-a\n" },
+							{ path: "b.ts", diff: "...", snapshotsPruned: true },
+							{ path: "c.ts", diff: "", isError: true, errorText: "boom" },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
+		expect(diffBlocks).toEqual([{ type: "diff", path: "a.ts", oldText: "before-a\n", newText: "after-a\n" }]);
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe(
+			"```\nAlso applied (diff omitted: file snapshot too large): b.ts\n\nError editing c.ts: boom\n```",
+		);
+	});
+
 	it("preserves LSP diagnostics alongside a successful edit's diff", () => {
 		// Regression test (oh-my-pi/oh-my-pi#7078 round-7 finding): edit tools
 		// route through `wrapToolWithMetaNotice`, which appends a rendered

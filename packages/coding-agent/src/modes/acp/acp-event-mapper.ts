@@ -425,9 +425,12 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(combinedText) : combinedText)]
 						: diffContent;
 				} else if (diffContent.length > 0 && event.isError) {
+					const prunedText = extractPrunedEditPathsText(event.result);
 					const failureText = extractEditFailureText(event.result);
 					const combinedText = failureText
-						? [failureText, extractOutputNoticeText(event.result)].filter((t): t is string => !!t).join("\n\n")
+						? [prunedText, failureText, extractOutputNoticeText(event.result)]
+								.filter((t): t is string => !!t)
+								.join("\n\n")
 						: extractReadableText(event.result);
 					resultContent = combinedText
 						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(combinedText) : combinedText)]
