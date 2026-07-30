@@ -23,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { formatOutputNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
 
 function makeAssistantMessage(text: string) {
@@ -540,6 +541,97 @@ describe("ACP event mapper", () => {
 		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
 		expect(textBlocks).toHaveLength(1);
 		expect(textBlocks[0]?.content?.text).toBe("```\nAlso applied (diff omitted: file snapshot too large): b.ts\n```");
+	});
+
+	it("preserves LSP diagnostics alongside a successful edit's diff", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 round-7 finding): edit tools
+		// route through `wrapToolWithMetaNotice`, which appends a rendered
+		// "LSP Diagnostics (...)" notice onto the tool's own text content from
+		// `details.meta.diagnostics`. The diff-present success branch discarded
+		// the whole content array in favor of the diff, taking that notice
+		// down with it whenever there was nothing to prune. Diagnostics on a
+		// successful edit must survive next to the diff.
+		const meta = { diagnostics: { summary: "1 warning", messages: ["a.ts:3: unused import"] } };
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-diagnostics",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts" }],
+					details: {
+						perFileResults: [{ path: "a.ts", diff: "...", oldText: "before-a\n", newText: "after-a\n" }],
+						meta,
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
+		expect(diffBlocks).toEqual([{ type: "diff", path: "a.ts", oldText: "before-a\n", newText: "after-a\n" }]);
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe(`\`\`\`\n${formatOutputNotice(meta).trim()}\n\`\`\``);
+	});
+
+	it("preserves LSP diagnostics alongside a partially-failed edit's per-file failure text", () => {
+		// Same discard, mirrored for the error branch: `extractEditFailureText`
+		// reads only `perFileResults`, so a diagnostics notice attached to the
+		// same result was dropped there too whenever there were per-file errors
+		// to report (the `extractReadableText` fallback path already included
+		// it, but that path is skipped once failure text exists).
+		const meta = { diagnostics: { summary: "1 warning", messages: ["a.ts:3: unused import"] } };
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-diagnostics-failure",
+				toolName: "edit",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts" }],
+					details: {
+						perFileResults: [
+							{ path: "a.ts", diff: "...", oldText: "before-a\n", newText: "after-a\n" },
+							{ path: "b.ts", isError: true, errorText: "boom" },
+						],
+						meta,
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
+		expect(diffBlocks).toEqual([{ type: "diff", path: "a.ts", oldText: "before-a\n", newText: "after-a\n" }]);
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe(
+			`\`\`\`\nError editing b.ts: boom\n\n${formatOutputNotice(meta).trim()}\n\`\`\``,
+		);
 	});
 
 	it("shows only diffs when every successful entry still has one, even with an unrelated pruned+errored entry", () => {

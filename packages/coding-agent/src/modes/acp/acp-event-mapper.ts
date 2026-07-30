@@ -10,6 +10,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { parseEditTargetPath } from "../../edit";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import { formatOutputNotice, type OutputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
 import { canonicalizeMessage } from "../../utils/thinking-display";
@@ -410,16 +411,26 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// entry-by-entry failure guidance folded into the joined result text,
 				// so fall back to that when there's no per-file breakdown to draw
 				// from.
+				// `result.details.meta` (truncation/limit/LSP-diagnostics notices
+				// `wrapToolWithMetaNotice` appended to the tool's own text content) is
+				// otherwise silently dropped by every branch below that discards the
+				// general content array in favor of a diff — re-derive and re-append it
+				// from the structured `meta` field instead of the (now-discarded) text.
 				let resultContent: ToolCallContent[];
 				if (diffContent.length > 0 && !event.isError) {
 					const prunedText = extractPrunedEditPathsText(event.result);
-					resultContent = prunedText
-						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(prunedText) : prunedText)]
+					const noticeText = extractOutputNoticeText(event.result);
+					const combinedText = [prunedText, noticeText].filter((t): t is string => !!t).join("\n\n");
+					resultContent = combinedText
+						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(combinedText) : combinedText)]
 						: diffContent;
 				} else if (diffContent.length > 0 && event.isError) {
-					const failureText = extractEditFailureText(event.result) ?? extractReadableText(event.result);
-					resultContent = failureText
-						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(failureText) : failureText)]
+					const failureText = extractEditFailureText(event.result);
+					const combinedText = failureText
+						? [failureText, extractOutputNoticeText(event.result)].filter((t): t is string => !!t).join("\n\n")
+						: extractReadableText(event.result);
+					resultContent = combinedText
+						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(combinedText) : combinedText)]
 						: diffContent;
 				} else {
 					resultContent = [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
@@ -1265,6 +1276,25 @@ function extractPrunedEditPathsText(result: unknown): string | undefined {
 	}
 	if (paths.length === 0) return undefined;
 	return `Also applied (diff omitted: file snapshot too large): ${paths.join(", ")}`;
+}
+
+/**
+ * Re-render `wrapToolWithMetaNotice`'s notice (truncation/limit text, and
+ * critically LSP diagnostics from a successful edit) directly from the
+ * structured `details.meta` field, independent of whatever text content it
+ * was originally appended to. The edit-content branches above discard the
+ * general content array whenever a diff exists, which would otherwise take
+ * this notice down with it — diagnostics on a successful edit are exactly as
+ * real as diagnostics on any other tool call and must survive next to the
+ * diff, not just in "Copy as Markdown" export.
+ */
+function extractOutputNoticeText(result: unknown): string | undefined {
+	if (typeof result !== "object" || result === null) return undefined;
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const meta = (details as { meta?: OutputMeta }).meta;
+	const notice = formatOutputNotice(meta).trim();
+	return notice.length > 0 ? notice : undefined;
 }
 
 function buildDiffContent(entry: unknown): ToolCallContent | undefined {
