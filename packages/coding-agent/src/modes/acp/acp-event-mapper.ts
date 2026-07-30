@@ -788,25 +788,33 @@ function buildTerminalMetaOutputData(toolName: string, args: unknown, output: st
 }
 
 /**
- * Bytes of `sent`'s tail trialled as an overlap candidate when a snapshot is
- * not a plain extension of it. Bounded well above a single streamed chunk or
- * tail-buffer roll increment — the only shapes this branch legitimately
- * sees — since the trial cost is quadratic in this bound.
- */
-const MAX_OVERLAP_TRIAL_BYTES = 4096;
-
-/**
  * Length of the longest suffix of `sent` that is also a prefix of `next`,
  * i.e. how many trailing bytes of `sent` reappear at the start of `next`.
- * Tries the longest candidate first so a tail window that rolled forward
- * splices where it actually continues rather than under-crediting overlap.
+ *
+ * Searches the *entire* retained `sent`/`next` window rather than a fixed
+ * trial bound. A naive longest-candidate-first scan capped at some byte
+ * count (to keep per-candidate `startsWith` trials affordable) misses
+ * genuine overlap once a tail-buffer roll — 50 KB for bash, 100 KB for eval,
+ * see `DEFAULT_MAX_BYTES` — exceeds that cap: `deliveredOverlap` then
+ * returns 0, and the caller suppresses the rest of the stream including the
+ * final `tool_execution_end` payload. Instead this runs in
+ * O(sent.length + next.length) via the KMP failure function of
+ * `next + "\0" + sent`: its last entry is the longest prefix of `next` that
+ * is also a suffix of the combined string, which — since the separator byte
+ * can never match either side — is exactly the longest suffix of `sent`
+ * matching a prefix of `next`.
  */
 function deliveredOverlap(sent: string, next: string): number {
-	const maxK = Math.min(sent.length, next.length, MAX_OVERLAP_TRIAL_BYTES);
-	for (let k = maxK; k > 0; k--) {
-		if (next.startsWith(sent.slice(sent.length - k))) return k;
+	if (sent.length === 0 || next.length === 0) return 0;
+	const combined = `${next}\u0000${sent}`;
+	const failure = new Uint32Array(combined.length);
+	for (let i = 1; i < combined.length; i++) {
+		let j = failure[i - 1];
+		while (j > 0 && combined[i] !== combined[j]) j = failure[j - 1];
+		if (combined[i] === combined[j]) j++;
+		failure[i] = j;
 	}
-	return 0;
+	return failure[combined.length - 1];
 }
 
 /**

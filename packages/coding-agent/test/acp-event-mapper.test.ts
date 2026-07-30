@@ -1482,6 +1482,54 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("resolves overlap correctly when it exceeds the old fixed 4096-byte trial cap", () => {
+		// The naive longest-candidate-first scan this superseded only tried
+		// suffixes up to MAX_OVERLAP_TRIAL_BYTES (4096); a tail-buffer roll on
+		// eval's 100 KB / bash's 50 KB window commonly overlaps by far more
+		// than that, which made the old scan return 0 and suppress the rest of
+		// the stream. Build a rollover whose genuine overlap is well past 4096
+		// bytes and confirm only the truly new bytes are delivered.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		const lines = Array.from({ length: 200 }, (_, i) => `line ${i} ${"y".repeat(40)}`);
+		const full = `${lines.join("\n")}\n`;
+		const droppedPrefix = `${lines.slice(0, 10).join("\n")}\n`;
+		const overlap = full.slice(droppedPrefix.length);
+		expect(overlap.length).toBeGreaterThan(4096);
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-big-roll",
+				toolName: "bash",
+				args: { command: "seq 1 200" },
+				partialResult: { content: [{ type: "text", text: full }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const rolled = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-big-roll",
+				toolName: "bash",
+				args: { command: "seq 1 200" },
+				partialResult: { content: [{ type: "text", text: `${overlap}NEW_LINE_APPENDED` }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const update = rolled[0]!.update as { _meta?: Record<string, unknown> };
+		expect(update._meta).toEqual({
+			terminal_output: { terminal_id: "tc-big-roll", data: "NEW_LINE_APPENDED" },
+		});
+	});
+
 	it("suppresses a snapshot with no overlap against delivered text instead of resending it whole", () => {
 		// No genuine overlap exists (the producer emitted something wholly
 		// unrelated to what's already on screen). Appending it whole would
