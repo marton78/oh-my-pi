@@ -1481,6 +1481,61 @@ describe("ACP event mapper", () => {
 		expect("_meta" in start).toBe(false);
 	});
 
+	it("routes a pty bash call through the meta terminal even when the client is realTerminalCapable", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4820222626): BashTool
+		// explicitly skips `clientBridge.createTerminal` whenever `pty: true` is
+		// requested (PTY output needs the local interactive terminal UI
+		// instead), so no real client-owned terminal is ever created for one of
+		// these regardless of `realTerminalCapable`. `wantsMetaTerminal` used
+		// to key purely off `realTerminalCapable`, so a pty call fell back to
+		// the fenced-text path and was capped at `ACP_TEXT_LIMIT` even on a
+		// terminalMetaCapable client that could render it untruncated.
+		const start = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-pty",
+				toolName: "bash",
+				args: { command: "vim", pty: true },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		)[0]!.update as { content?: Array<{ type: string; terminalId?: string }>; _meta?: Record<string, unknown> };
+		expect(start.content).toEqual([{ type: "terminal", terminalId: "tc-pty" }]);
+		expect(start._meta).toEqual({ terminal_info: { terminal_id: "tc-pty" } });
+
+		const end = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-pty",
+				toolName: "bash",
+				isError: false,
+				result: { content: [{ type: "text", text: "pty output" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true, getToolArgs: () => ({ command: "vim", pty: true }) },
+		)[0]!.update as { content?: Array<{ type: string; terminalId?: string }>; _meta?: Record<string, unknown> };
+		expect(end.content).toEqual([{ type: "terminal", terminalId: "tc-pty" }]);
+		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-pty", data: "pty output" },
+			terminal_exit: { terminal_id: "tc-pty", exit_code: 0, signal: null },
+		});
+	});
+
+	it("does not route a non-pty bash call through the meta terminal when a real client terminal is available", () => {
+		const start = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "tc-non-pty",
+				toolName: "bash",
+				args: { command: "echo hi", pty: false },
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		)[0]!.update as { content?: unknown; _meta?: unknown };
+		expect("content" in start).toBe(false);
+		expect("_meta" in start).toBe(false);
+	});
+
 	it("registers a meta terminal on eval start and reports output/exit at the end", () => {
 		const startUpdates = mapAgentSessionEventToAcpSessionUpdates(
 			{

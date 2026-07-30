@@ -302,7 +302,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			// `tool_execution_end`. `buildMetaTerminalDelta` diffs against what was
 			// already sent so a growing cumulative snapshot becomes an append-only
 			// byte stream instead of duplicating everything shown so far.
-			if (wantsMetaTerminal(event.toolName, options)) {
+			if (wantsMetaTerminal(event.toolName, event.args, options)) {
 				const partialText = extractTerminalStreamText(event.partialResult);
 				if (partialText) {
 					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, event.args, partialText, options);
@@ -340,7 +340,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				status: event.isError ? "failed" : "completed",
 				rawOutput: event.result,
 			};
-			if (wantsMetaTerminal(event.toolName, options)) {
+			if (wantsMetaTerminal(event.toolName, args, options)) {
 				const images = extractMetaTerminalImageToolCallContent(event.result, options);
 				const finalOutput = extractTerminalStreamText(event.result) ?? extractReadableText(event.result) ?? "";
 				if (images.length > 0) {
@@ -684,7 +684,7 @@ export function buildToolCallStartUpdate(
 		status: input.status ?? "pending",
 		rawInput: input.args,
 	};
-	if (wantsMetaTerminal(input.toolName, options)) {
+	if (wantsMetaTerminal(input.toolName, input.args, options)) {
 		// Pre-register the display-only terminal under the tool call's own id
 		// (see `wantsMetaTerminal`) so its output/exit can land later, on
 		// `tool_execution_end`, purely through `_meta` — no live client-owned
@@ -1058,17 +1058,30 @@ function isCommandToolName(toolName: string): boolean {
  * by the tool call's own id) instead of a live client-owned terminal or a
  * fenced text block. `eval` never spawns a live terminal, so it always
  * qualifies; `bash`/`shell`/`exec` only fall back to it when the live path
- * (`terminal/create`) is unavailable — no real terminal capability, or
- * `session/load` replay, where `realTerminalCapable` is forced `false`
- * because no live process exists to attach a new client terminal to. Gated
- * on `terminalMetaCapable` throughout: a client that doesn't understand the
- * convention must get the fenced-text fallback instead of a dangling,
- * unrenderable terminal reference.
+ * (`terminal/create`) is unavailable — no real terminal capability,
+ * `session/load` replay (`realTerminalCapable` forced `false` because no
+ * live process exists to attach a new client terminal to), or a `pty: true`
+ * call: `BashTool` explicitly skips `clientBridge.createTerminal` whenever
+ * `pty` is requested (PTY output needs the local interactive terminal UI
+ * instead — see `canUseInteractiveBashPty`), so no real client-owned
+ * terminal is ever created for one of these regardless of what the client
+ * advertises. Without this, a `pty` call fell back to the fenced-text path
+ * and was capped at `ACP_TEXT_LIMIT` (4,000 chars) even on a
+ * `terminalMetaCapable` client that could have rendered it untruncated.
+ * Gated on `terminalMetaCapable` throughout: a client that doesn't
+ * understand the convention must get the fenced-text fallback instead of a
+ * dangling, unrenderable terminal reference.
  */
-export function wantsMetaTerminal(toolName: string, options: AcpEventMapperOptions): boolean {
+export function wantsMetaTerminal(toolName: string, args: unknown, options: AcpEventMapperOptions): boolean {
 	if (!options.terminalMetaCapable) return false;
 	if (toolName === "eval") return true;
-	return isCommandToolName(toolName) && options.realTerminalCapable !== true;
+	if (!isCommandToolName(toolName)) return false;
+	return options.realTerminalCapable !== true || isPtyRequested(args);
+}
+
+function isPtyRequested(args: unknown): boolean {
+	if (typeof args !== "object" || args === null || !("pty" in args)) return false;
+	return args.pty === true;
 }
 
 /**
