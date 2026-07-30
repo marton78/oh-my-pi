@@ -40,6 +40,26 @@ feature adoption alike. Read this before touching ACP code.
    client and never cross a real stdio transport, so they cannot catch framing bugs,
    stdout pollution, or capability gating that only misbehaves once a real `initialize`
    handshake and interleaved JSON-RPC ids are involved.
+7. **A gate/invariant violation is a class of bug, not an instance.** `has_terminals`
+   (`thread_view.rs`) hides *every* sibling `content` item for *any* terminal-bearing
+   tool call, live or meta. When you find (or are told) one violation — e.g. bash's
+   notices riding as sibling content — grep every other code path that builds
+   `content` alongside a terminal item (`eval`'s images, any future execute-kind tool)
+   and fix all of them in the same commit. Don't wait for review to find the second
+   occurrence of a bug whose mechanism you already understand.
+8. **New incremental/derived stream state ships with its own boundary test in the
+   commit that introduces it.** Watermarks, overlap/resync scans, delta encoders —
+   anything that accumulates or compares across updates — needs a test at the
+   boundary that breaks a naive implementation (overlap larger than your scan
+   window, growth across many updates past any single producer's buffer cap) before
+   you open the PR, not after a reviewer's stress case finds it. (PR #7078 shipped
+   both a >4096-byte overlap-scan cap and an unbounded watermark-growth bug this way,
+   each caught in a later round of the same review.)
+9. **Every new `_meta.*` emission is paired with its capability gate in the same
+   diff.** Before submitting, grep all `_meta.terminal_*` (or any new ad hoc
+   extension) call sites against `AcpEventMapperOptions` and confirm each is behind
+   the matching `clientCapabilities` check — an ungated extension silently breaks a
+   spec-compliant client that never negotiated it.
 
 ## Running the probe against omp
 
