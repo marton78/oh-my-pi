@@ -1529,7 +1529,10 @@ function extractDetailsNotices(value: unknown): string | undefined {
  * `TailBuffer(DEFAULT_MAX_BYTES * 2)`, bash truncates and says so in its own
  * notices), `claude-agent-acp` sends `terminal_output` untruncated, and Zed
  * truncates for display on its own (`original_content_len` vs `content.len()`
- * in `thread_view.rs`).
+ * in `thread_view.rs`). For the same reason this must not `.trim()` the
+ * joined text: terminal data is append-only process bytes, so leading
+ * indentation and whitespace-only chunks are meaningful and must survive
+ * verbatim, unlike Markdown content where trimming is a display nicety.
  */
 function extractTerminalStreamText(value: unknown): string | undefined {
 	const blocks = getContentBlocks(value);
@@ -1537,8 +1540,7 @@ function extractTerminalStreamText(value: unknown): string | undefined {
 	const text = blocks
 		.map(block => extractStringProperty<TextLikeContent>(block, "text"))
 		.filter((chunk): chunk is string => typeof chunk === "string" && chunk.length > 0)
-		.join("\n")
-		.trim();
+		.join("\n");
 	return text.length > 0 ? text : undefined;
 }
 

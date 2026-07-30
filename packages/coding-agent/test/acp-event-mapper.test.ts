@@ -1429,13 +1429,12 @@ describe("ACP event mapper", () => {
 		);
 		const end = endUpdates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
 		if (end._meta?.terminal_output?.data) delivered += end._meta.terminal_output.data;
-		// The header is sent exactly once, up front; every raw byte follows,
-		// with no truncation and no duplication. Only the very last trailing
-		// newline is missing — `extractTerminalStreamText`'s `.trim()`
-		// (applied to each cumulative snapshot before diffing) strips it, same
-		// as the old text-content path always did; not something this fix
-		// changes.
-		expect(delivered).toBe(header + raw.trimEnd());
+		// The header is sent exactly once, up front; every raw byte follows
+		// verbatim, with no truncation, no duplication, and no trailing-newline
+		// loss — `extractTerminalStreamText` preserves terminal snapshots as
+		// append-only process bytes instead of trimming them like the
+		// text-content path.
+		expect(delivered).toBe(header + raw);
 	});
 
 	it("splices only the undelivered remainder when a snapshot rolls its tail window forward without being a plain extension", () => {
