@@ -1287,23 +1287,26 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 		// that isn't otherwise represented in the terminal.
 		//
 		// `details.notices` (exit code, truncation marker, `[raw output:
-		// artifact://N]` pointer) is deliberately NOT added here as sibling
-		// `content`: Zed's `has_terminals` (`thread_view.rs`) renders a
-		// terminal-bearing tool call exclusively through the terminal card,
-		// silently dropping every other `content` item from the live view (it
-		// only resurfaces via "Copy as Markdown"/thread export, which walks
-		// `content` unconditionally regardless of a sibling terminal). The
-		// caller (`tool_execution_end`'s non-meta-terminal branch) instead
-		// appends notices as extra `_meta.terminal_output` bytes keyed by this
-		// *same* real terminal id — Zed's `on_terminal_provider_event`
-		// (`agent_servers/acp.rs`) writes `_meta.terminal_output` straight into
-		// whatever terminal buffer already owns that id, real or
-		// display-only, so the notices genuinely render inside the live
-		// terminal card instead of being dropped.
+		// artifact://N]` pointer): a Zed client (`options.terminalMetaCapable`)
+		// gets these via `_meta.terminal_output` on the *same* real terminal id
+		// instead of sibling `content` — Zed's `has_terminals` (`thread_view.rs`)
+		// renders a terminal-bearing tool call exclusively through the terminal
+		// card, silently dropping every sibling `content` item, but
+		// `on_terminal_provider_event` (`agent_servers/acp.rs`) writes
+		// `_meta.terminal_output` straight into whatever terminal buffer already
+		// owns that id (see the caller, `buildLiveTerminalNoticeMeta`). A client
+		// that advertises real terminal support but hasn't negotiated that ad
+		// hoc Zed extension has no such channel — the ACP schema doesn't say
+		// terminal content is exclusive of siblings, that's purely Zed's own
+		// renderer choice, so a different compliant client might still render
+		// sibling text fine. Keep the old best-effort sibling append for it:
+		// strictly not worse than silently dropping the notices everywhere.
+		const notices = options.terminalMetaCapable ? undefined : extractDetailsNotices(value);
 		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
-		const content = hasTerminalContent(nonTextContent, terminalId)
+		const withTerminal = hasTerminalContent(nonTextContent, terminalId)
 			? nonTextContent
 			: [...nonTextContent, terminalToolCallContent(terminalId)];
+		const content = notices ? [...withTerminal, textToolCallContent(notices)] : withTerminal;
 		const directText = extractDirectText(value);
 		if (!directText || hasEquivalentTextContent(content, directText)) {
 			return content;
@@ -1604,11 +1607,19 @@ function extractDetailsNotices(value: unknown): string | undefined {
  * `has_terminals` gate would silently drop. Only ever called once, from
  * `tool_execution_end` — there is no earlier point where bash's own notices
  * (computed from the final result) exist to send.
+ *
+ * Gated on `options.terminalMetaCapable`: `_meta.terminal_output` is Zed's own
+ * ad hoc v1 extension, not part of the ACP schema. A client that advertises
+ * real terminal support (so it reaches this function's caller at all) but
+ * hasn't negotiated that extension would receive data on a channel it has no
+ * way to know about — `extractToolCallContent`'s matching branch falls back
+ * to a sibling `content` item for exactly this case instead.
  */
 function buildLiveTerminalNoticeMeta(
 	value: unknown,
 	options: AcpEventMapperOptions,
 ): { terminal_output: { terminal_id: string; data: string } } | undefined {
+	if (!options.terminalMetaCapable) return undefined;
 	const terminalId = extractTerminalId(value);
 	if (!terminalId || !(options.isTerminalLive?.(terminalId) ?? true)) return undefined;
 	const notices = extractDetailsNotices(value);

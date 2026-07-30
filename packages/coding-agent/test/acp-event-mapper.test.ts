@@ -1152,6 +1152,7 @@ describe("ACP event mapper", () => {
 				},
 			} as AgentSessionEvent,
 			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
 		);
 
 		expect(updates).toHaveLength(1);
@@ -1166,6 +1167,44 @@ describe("ACP event mapper", () => {
 			terminal_id: "term-1",
 			data: "\nCommand exited with code 1\n[raw output: artifact://7]\n",
 		});
+	});
+
+	it("falls back to sibling content for live-terminal notices when the client hasn't negotiated _meta.terminal_output", () => {
+		// Regression test: a client can advertise real ACP terminal support
+		// (`terminal: true`) without negotiating Zed's ad hoc
+		// `_meta.terminal_output` extension. `_meta.terminal_output` data means
+		// nothing to such a client, and the live-terminal branch had stopped
+		// emitting any sibling content for notices at all — the notices were
+		// silently dropped entirely rather than falling back to the
+		// best-effort sibling `content` item a spec-compliant (non-Zed) client
+		// might still render.
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-notices-no-meta",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "boom\n\nCommand exited with code 1" }],
+					details: {
+						terminalId: "term-2",
+						exitCode: 1,
+						notices: ["Command exited with code 1"],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: false },
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as { content?: unknown; _meta?: unknown };
+		expect(update.content).toEqual([
+			{ type: "terminal", terminalId: "term-2" },
+			{ type: "content", content: { type: "text", text: "Command exited with code 1" } },
+		]);
+		expect(update._meta).toBeUndefined();
 	});
 
 	it("renders recorded output as text when the terminal id is not live", () => {
