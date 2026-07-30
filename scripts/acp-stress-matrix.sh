@@ -36,8 +36,13 @@ total=24
 n=0
 
 run_probe() {
-	# run_probe <label> <expect-exit> <probe-args...>
-	local label="$1" want="$2"
+	# run_probe <label> <assertion> <probe-args...>
+	# assertion: "exit=<N>" compares the subcommand's own exit code (kill-mid-tool);
+	#            "min=<N>" compares parsed delivered= against a computed floor
+	#            (stress-output — its own exit code assumes "delivered < requested"
+	#            is always a bug, which is wrong once requested exceeds the tool's
+	#            own producer-side cap; see the size loop below).
+	local label="$1" assertion="$2"
 	shift 2
 	n=$((n + 1))
 	printf '[%2d/%d] %-28s ' "$n" "$total" "$label"
@@ -48,36 +53,50 @@ run_probe() {
 	local elapsed=$((SECONDS - start))
 	local delivered
 	delivered=$(grep -o 'delivered=[0-9]*' "$out" | tail -1 | cut -d= -f2)
-	local status="OK"
-	if [ "$code" != "$want" ]; then
-		status="REGRESSION"
-		fail=$((fail + 1))
-	else
-		pass=$((pass + 1))
-	fi
-	printf '%2ds  exit=%s want=%s delivered=%-8s %s\n' "$elapsed" "$code" "$want" "${delivered:-  -}" "$status"
-	rows+=("$(printf '%-28s exit=%s want=%s delivered=%-8s %s' "$label" "$code" "$want" "${delivered:-  -}" "$status")")
+	local status="OK" detail=""
+	case "$assertion" in
+	exit=*)
+		local want="${assertion#exit=}"
+		detail="exit=$code want=$want"
+		if [ "$code" != "$want" ]; then status="REGRESSION"; fi
+		;;
+	min=*)
+		local floor="${assertion#min=}"
+		detail="delivered=${delivered:-0} floor=$floor"
+		if [ -z "$delivered" ] || [ "$delivered" -lt "$floor" ]; then status="REGRESSION"; fi
+		;;
+	esac
+	if [ "$status" = OK ]; then pass=$((pass + 1)); else fail=$((fail + 1)); fi
+	printf '%2ds  %-30s %s\n' "$elapsed" "$detail" "$status"
+	rows+=("$(printf '%-28s %-30s %s' "$label" "$detail" "$status")")
 }
+
+# Producer-side caps below the ACP wire, not this PR's territory to fix:
+# bash's TailBuffer(DEFAULT_MAX_BYTES) and eval's TailBuffer(DEFAULT_MAX_BYTES * 2)
+# (streaming-output.ts: DEFAULT_MAX_BYTES = 50 * 1024) truncate before the mapper
+# ever sees the rest, with their own "(output truncated)" notice. Asking for more
+# than that and expecting full delivery is a test bug, not a wire regression — the
+# real assertion past the cap is "did the wire deliver ~the full retained window",
+# not "did it deliver the full request".
+fenced_cap=4000 # ACP_TEXT_LIMIT (acp-event-mapper.ts) — intentional, not a bug.
 
 echo "stress-output: tool x channel x size"
 for tool in bash eval; do
+	if [ "$tool" = eval ]; then producer_cap=102400; else producer_cap=51200; fi
 	for channel in meta fenced; do
 		if [ "$channel" = meta ]; then
 			caps=(--meta '{"terminal_output":true}')
+			cap=$producer_cap
 		else
 			caps=()
+			cap=$fenced_cap
 		fi
 		for size in 3000 4096 10000 60000 120000; do
-			# Meta-terminal path must never truncate, at any size (the exact
-			# regression rules 7-9 exist for). The fenced-text fallback is
-			# *supposed* to truncate above ACP_TEXT_LIMIT (documented as 4000
-			# chars) -- exit 1 there is the correct, unregressed behavior.
-			if [ "$channel" = meta ] || [ "$size" -le 4000 ]; then
-				want=0
-			else
-				want=1
-			fi
-			run_probe "$tool-$channel-$size" "$want" stress-output "$size" "$tool" "${caps[@]}"
+			expected=$size
+			[ "$expected" -gt "$cap" ] && expected=$cap
+			floor=$((expected - 300)) # slack for notices/fence markup/headers
+			[ "$floor" -lt 0 ] && floor=0
+			run_probe "$tool-$channel-$size" "min=$floor" stress-output "$size" "$tool" "${caps[@]}"
 		done
 	done
 done
@@ -91,7 +110,7 @@ for combo in none terminal meta both; do
 	meta) caps=(--meta '{"terminal_output":true}') ;;
 	both) caps=(--terminal --meta '{"terminal_output":true}') ;;
 	esac
-	run_probe "kill-mid-tool-$combo" 0 kill-mid-tool "Use the bash tool to run: sleep 20" "${caps[@]}"
+	run_probe "kill-mid-tool-$combo" "exit=0" kill-mid-tool "Use the bash tool to run: sleep 20" "${caps[@]}"
 done
 
 echo
