@@ -40,13 +40,21 @@ feature adoption alike. Read this before touching ACP code.
    client and never cross a real stdio transport, so they cannot catch framing bugs,
    stdout pollution, or capability gating that only misbehaves once a real `initialize`
    handshake and interleaved JSON-RPC ids are involved.
-7. **A gate/invariant violation is a class of bug, not an instance.** `has_terminals`
-   (`thread_view.rs`) hides *every* sibling `content` item for *any* terminal-bearing
-   tool call, live or meta. When you find (or are told) one violation — e.g. bash's
-   notices riding as sibling content — grep every other code path that builds
-   `content` alongside a terminal item (`eval`'s images, any future execute-kind tool)
-   and fix all of them in the same commit. Don't wait for review to find the second
-   occurrence of a bug whose mechanism you already understand.
+7. **A gate/invariant violation is a class of bug, not an instance — and this one is now
+   enforced, not just documented.** `has_terminals` (`thread_view.rs`) hides *every*
+   sibling `content` item for *any* terminal-bearing tool call, live or meta.
+   `AcpAgent#sendUpdate` (`acp-agent.ts`) is the single chokepoint every outbound
+   `session/update` passes through; it runs `assertAcpUpdateInvariants`
+   (`acp-update-invariants.ts`), which fails (throws under `bun test`, logs otherwise)
+   any frame whose `content` carries a terminal item alongside a sibling. It checks the
+   *finished* frame, so it catches violations assembled from merged/dynamically-built
+   content — not just literal array shapes a static search could see — including in
+   code paths not yet written. If you add a new execute-kind tool or a new
+   `content`-merging branch, this is your safety net, not a substitute for still
+   getting the shape right: a violation here means the same content a user would have
+   silently lost is now a loud, immediate test failure instead of something a reviewer
+   has to notice by eye.
+
 8. **New incremental/derived stream state ships with its own boundary test in the
    commit that introduces it.** Watermarks, overlap/resync scans, delta encoders —
    anything that accumulates or compares across updates — needs a test at the
@@ -55,11 +63,17 @@ feature adoption alike. Read this before touching ACP code.
    you open the PR, not after a reviewer's stress case finds it. (PR #7078 shipped
    both a >4096-byte overlap-scan cap and an unbounded watermark-growth bug this way,
    each caught in a later round of the same review.)
-9. **Every new `_meta.*` emission is paired with its capability gate in the same
-   diff.** Before submitting, grep all `_meta.terminal_*` (or any new ad hoc
-   extension) call sites against `AcpEventMapperOptions` and confirm each is behind
-   the matching `clientCapabilities` check — an ungated extension silently breaks a
-   spec-compliant client that never negotiated it.
+9. **Every `_meta.terminal_*` write goes through `buildTerminalMeta`
+   (`acp-event-mapper.ts`) — there is no other write site.** It returns `undefined`
+   unless `options.terminalMetaCapable`, so an ungated `_meta.terminal_*` emission
+   isn't just discouraged, it's unwritable: build the object through it instead of a
+   literal `{ terminal_output: {...} }`. `assertAcpUpdateInvariants` (rule 7's guard)
+   additionally fails any frame carrying a `_meta.terminal_*` key when the client never
+   negotiated the capability, so a stray direct-literal write outside the builder — or
+   any future ad hoc `_meta.*` extension gated on a different capability — is still
+   caught at the emit chokepoint even if it bypasses `buildTerminalMeta` entirely. For a
+   brand-new `_meta.*` extension unrelated to the terminal convention, add its own gate
+   check to `checkAcpUpdateInvariants` rather than assuming rule 7's guard covers it.
 
 ## Running the probe against omp
 
