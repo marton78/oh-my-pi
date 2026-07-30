@@ -1551,6 +1551,13 @@ describe("ACP agent", () => {
 		// fix only changed the tool call's `status` to `failed` on cleanup and
 		// never sent the matching `terminal_exit`, leaving the embedded terminal
 		// card permanently unterminated even though the call itself reads failed.
+		//
+		// Follow-up regression (oh-my-pi/oh-my-pi#7078 review 4819042330): Zed's
+		// `has_terminals` (`thread_view.rs`) routes a terminal-bearing tool call
+		// exclusively through the terminal card, so a sibling `content` text
+		// block explaining the interruption never renders — it must ride as
+		// `terminal_output` bytes on the same terminal id instead, and the
+		// sibling `content` block must not be sent at all for this case.
 		const harness = await createHarness();
 		await harness.agent.initialize({
 			protocolVersion: 1,
@@ -1596,7 +1603,11 @@ describe("ACP agent", () => {
 			);
 		const failedUpdate = toolUpdates.at(-1) as {
 			status?: string;
-			_meta?: { terminal_exit?: { terminal_id: string; exit_code: number | null; signal: null } };
+			content?: unknown;
+			_meta?: {
+				terminal_exit?: { terminal_id: string; exit_code: number | null; signal: null };
+				terminal_output?: { terminal_id: string; data: string };
+			};
 		};
 		expect(failedUpdate.status).toBe("failed");
 		expect(failedUpdate._meta?.terminal_exit).toEqual({
@@ -1604,6 +1615,11 @@ describe("ACP agent", () => {
 			exit_code: null,
 			signal: null,
 		});
+		expect(failedUpdate._meta?.terminal_output).toEqual({
+			terminal_id: "toolu_dangling_meta",
+			data: "\nInterrupted: no result recorded before the process ended.\n",
+		});
+		expect(failedUpdate.content).toBeUndefined();
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

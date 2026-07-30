@@ -2129,27 +2129,34 @@ export class AcpAgent implements Agent {
 		for (const toolCallId of announcedToolCallIds) {
 			if (resolvedToolCallIds.has(toolCallId)) continue;
 			const toolName = announcedToolNames.get(toolCallId);
+			const explanation = "Interrupted: no result recorded before the process ended.";
 			// A dangling call that registered a display-only meta terminal at its
 			// `tool_call` start (see `buildToolCallStartUpdate`) owes that terminal
 			// a `terminal_exit` — without one Zed's embedded terminal card stays
 			// open forever even though the tool call itself now reads `failed`.
-			const metaTerminalExit =
-				toolName && wantsMetaTerminal(toolName, { terminalMetaCapable: this.#terminalMetaCapable() })
-					? { terminal_exit: { terminal_id: toolCallId, exit_code: null, signal: null } }
-					: undefined;
+			// Zed's `has_terminals` (`thread_view.rs`) routes a terminal-bearing
+			// tool call exclusively through the terminal card, so the sibling
+			// `content` text below never renders for one of these — the
+			// explanation must ride as `terminal_output` bytes on the same
+			// terminal id instead, sent before the `terminal_exit`.
+			const isMetaTerminal =
+				!!toolName && wantsMetaTerminal(toolName, { terminalMetaCapable: this.#terminalMetaCapable() });
+			const metaTerminalMeta = isMetaTerminal
+				? {
+						terminal_output: { terminal_id: toolCallId, data: `\n${explanation}\n` },
+						terminal_exit: { terminal_id: toolCallId, exit_code: null, signal: null },
+					}
+				: undefined;
 			await this.#connection.sessionUpdate({
 				sessionId: record.session.sessionId,
 				update: {
 					sessionUpdate: "tool_call_update",
 					toolCallId,
 					status: "failed",
-					content: [
-						{
-							type: "content",
-							content: { type: "text", text: "Interrupted: no result recorded before the process ended." },
-						},
-					],
-					...(metaTerminalExit ? { _meta: metaTerminalExit } : {}),
+					...(isMetaTerminal
+						? {}
+						: { content: [{ type: "content", content: { type: "text", text: explanation } }] }),
+					...(metaTerminalMeta ? { _meta: metaTerminalMeta } : {}),
 				},
 			});
 		}
