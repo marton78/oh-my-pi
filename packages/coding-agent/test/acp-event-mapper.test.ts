@@ -652,6 +652,45 @@ describe("ACP event mapper", () => {
 		expect(textBlocks[0]?.content?.text).not.toContain("Updated bar.ts");
 	});
 
+	it("keeps 'Files NOT applied' guidance for files never attempted after an earlier failure", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-edit-partial-fail-unattempted",
+				toolName: "edit",
+				isError: true,
+				result: {
+					content: [
+						{
+							type: "text",
+							text: "Updated foo.ts\nError editing skipped.ts: boom\nFiles already applied: foo.ts.\nFiles NOT applied: never.ts; re-read the affected files and re-issue only the failed and unapplied files.",
+						},
+					],
+					details: {
+						perFileResults: [
+							{ path: "foo.ts", diff: "...", oldText: "before-foo\n", newText: "after-foo\n" },
+							{ path: "skipped.ts", diff: "", isError: true, errorText: "boom" },
+						],
+						unattemptedPaths: ["never.ts"],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		const update = updates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		// `never.ts` was never in `perFileResults` at all — only `unattemptedPaths`
+		// says it exists — so it must still reach the client as guidance, not be
+		// silently dropped alongside the discarded full joined text.
+		expect(textBlocks[0]?.content?.text).toBe(
+			"```\nError editing skipped.ts: boom\nFiles NOT applied: never.ts; re-read the affected files and re-issue only the failed and unapplied files.\n```",
+		);
+	});
+
 	it("includes the target file in the edit tool's title for every edit mode", () => {
 		const pathStart = mapAgentSessionEventToAcpSessionUpdates(
 			{

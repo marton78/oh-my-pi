@@ -154,6 +154,7 @@ async function executeApplyPatchPerFile(
 
 	const perFileResults: EditToolPerFileResult[] = [];
 	const contentTexts: string[] = [];
+	const unattemptedPaths: string[] = [];
 	let hasError = false;
 
 	for (let i = 0; i < fileEntries.length; i++) {
@@ -204,12 +205,9 @@ async function executeApplyPatchPerFile(
 				contentTexts.push(`Files already applied: ${appliedPaths}.`);
 			}
 			if (i + 1 < fileEntries.length) {
-				const skippedPaths = fileEntries
-					.slice(i + 1)
-					.map(e => e.path)
-					.join(", ");
+				unattemptedPaths.push(...fileEntries.slice(i + 1).map(e => e.path));
 				contentTexts.push(
-					`Files NOT applied: ${skippedPaths}; re-read the affected files and re-issue only the failed and unapplied files.`,
+					`Files NOT applied: ${unattemptedPaths.join(", ")}; re-read the affected files and re-issue only the failed and unapplied files.`,
 				);
 			}
 			// Stopping early skips the last-entry flush above; finalize the
@@ -247,6 +245,7 @@ async function executeApplyPatchPerFile(
 				.join("\n"),
 			firstChangedLine: perFileResults.find(r => r.firstChangedLine)?.firstChangedLine,
 			perFileResults,
+			...(unattemptedPaths.length > 0 ? { unattemptedPaths } : {}),
 		}),
 		// Any per-file failure marks the aggregate result as an error so the
 		// agent loop and renderer take the error branch instead of treating
