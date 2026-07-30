@@ -1544,6 +1544,49 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("does not synthesize a failed update for a dangling internal Hub call", async () => {
+		// Regression test: an internal Hub coordination call
+		// (`isInternalHubMessageTool`) never gets a `tool_call` notification --
+		// the mapper returns `[]` for its start. If a process dies before that
+		// call's result is persisted, the dangling-cleanup loop must not
+		// synthesize a `tool_call_update` for a `toolCallId` the client was
+		// never told about in the first place (an orphan update that would also
+		// leak an internal call's existence).
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "Delegate this task", timestamp: Date.now() });
+		stored.sessionManager.appendMessage({
+			...makeAssistantMessage(""),
+			content: [
+				{
+					type: "toolCall",
+					id: "toolu_hub_dangling",
+					name: "hub",
+					arguments: { op: "send", to: "Scout", message: "Private coordination" },
+				},
+			],
+			stopReason: "toolUse",
+		});
+		// No matching toolResult message -- the process died before persisting one.
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		const hubUpdates = harness.updates
+			.filter(update => update.sessionId === stored.sessionId)
+			.map(notification => notification.update)
+			.filter(update => "toolCallId" in update && update.toolCallId === "toolu_hub_dangling");
+		expect(hubUpdates).toEqual([]);
+
+		harness.abortController.abort();
+	});
+
 	it("does not synthesize a failed update for a tool call that already resolved", async () => {
 		const harness = await createHarness();
 		const stored = new FakeAgentSession(harness.cwdA);

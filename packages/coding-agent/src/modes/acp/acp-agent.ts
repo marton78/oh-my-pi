@@ -2064,8 +2064,19 @@ export class AcpAgent implements Agent {
 		const cwd = record.session.sessionManager.getCwd();
 		const replayedToolCallIds = new Set<string>();
 		const replayedToolCallArgs = new Map<string, unknown>();
+		// Ids that actually got a `tool_call` notification sent to the client
+		// (i.e. `mapAgentSessionEventToAcpSessionUpdates` returned a non-empty
+		// start). Distinct from `replayedToolCallIds`, which also tracks ids
+		// suppressed on purpose (`isInternalHubMessageTool`) so `#replayToolResult`
+		// never re-attempts their start through its own, narrower args
+		// reconstruction (`#buildReplayToolArgs` only knows `path`, so it can't
+		// re-derive hub args and would wrongly un-suppress them). Only an id in
+		// *this* set was ever announced, so only these can dangle in the
+		// client's eyes — the cleanup loop below must never synthesize a
+		// `tool_call_update` for a `toolCallId` the client was never told about.
+		const announcedToolCallIds = new Set<string>();
 		// Ids that reached a persisted `toolResult` message during replay. Any
-		// id left in `replayedToolCallIds` but not here was started (assistant
+		// id left in `announcedToolCallIds` but not here was started (assistant
 		// turn persisted) but never finished — the process was killed before
 		// its result landed. `keepDanglingToolCalls` (below) is what makes such
 		// a call replay at all instead of being silently dropped; see the
@@ -2089,6 +2100,7 @@ export class AcpAgent implements Agent {
 				cwd,
 				replayedToolCallIds,
 				replayedToolCallArgs,
+				announcedToolCallIds,
 				resolvedToolCallIds,
 			)) {
 				await this.#connection.sessionUpdate(notification);
@@ -2105,7 +2117,7 @@ export class AcpAgent implements Agent {
 		// tool-call status, so `failed` is the terminal state available; this
 		// keeps the call visible (why `keepDanglingToolCalls` is used at all)
 		// without a permanent spinner.
-		for (const toolCallId of replayedToolCallIds) {
+		for (const toolCallId of announcedToolCallIds) {
 			if (resolvedToolCallIds.has(toolCallId)) continue;
 			await this.#connection.sessionUpdate({
 				sessionId: record.session.sessionId,
@@ -2130,10 +2142,18 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
+		announcedToolCallIds: Set<string>,
 		resolvedToolCallIds: Set<string>,
 	): SessionNotification[] {
 		if (message.role === "assistant") {
-			return this.#replayAssistantMessage(sessionId, message, cwd, replayedToolCallIds, replayedToolCallArgs);
+			return this.#replayAssistantMessage(
+				sessionId,
+				message,
+				cwd,
+				replayedToolCallIds,
+				replayedToolCallArgs,
+				announcedToolCallIds,
+			);
 		}
 		if (
 			message.role === "user" ||
@@ -2189,6 +2209,7 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
+		announcedToolCallIds: Set<string>,
 	): SessionNotification[] {
 		const notifications: SessionNotification[] = [];
 		const messageId = crypto.randomUUID();
@@ -2245,23 +2266,35 @@ export class AcpAgent implements Agent {
 					typeof toolItem.name === "string"
 				) {
 					const args = this.#buildReplayAssistantToolArgs(toolItem);
-					notifications.push(
-						...mapAgentSessionEventToAcpSessionUpdates(
-							{
-								type: "tool_execution_start",
-								toolCallId: toolItem.id,
-								toolName: toolItem.name,
-								args,
-							},
-							sessionId,
-							// No live client terminal can exist for a call replayed from a
-							// persisted transcript (see `#replayToolResult`'s matching note),
-							// so `realTerminalCapable` is forced `false` here too.
-							{ cwd, terminalMetaCapable: this.#terminalMetaCapable(), realTerminalCapable: false },
-						),
+					const startNotifications = mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_start",
+							toolCallId: toolItem.id,
+							toolName: toolItem.name,
+							args,
+						},
+						sessionId,
+						// No live client terminal can exist for a call replayed from a
+						// persisted transcript (see `#replayToolResult`'s matching note),
+						// so `realTerminalCapable` is forced `false` here too.
+						{ cwd, terminalMetaCapable: this.#terminalMetaCapable(), realTerminalCapable: false },
 					);
+					notifications.push(...startNotifications);
+					// Always dedup-track the id for `includeStart` below, even when
+					// suppressed (`isInternalHubMessageTool`) — `#replayToolResult`'s
+					// own args reconstruction (`#buildReplayToolArgs`, `path`-only)
+					// can't re-derive hub args and would wrongly un-suppress a start
+					// already (correctly) handled here. Only track in
+					// `announcedToolCallIds` when a `tool_call` notification actually
+					// went out — that's the set the dangling-cleanup loop in
+					// `#replaySessionHistory` walks, so it never synthesizes a
+					// `tool_call_update` for a `toolCallId` the client was never told
+					// about.
 					replayedToolCallIds.add(toolItem.id);
 					replayedToolCallArgs.set(toolItem.id, args);
+					if (startNotifications.length > 0) {
+						announcedToolCallIds.add(toolItem.id);
+					}
 				}
 			}
 		}
