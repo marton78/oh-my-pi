@@ -1488,6 +1488,114 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("marks a dangling replayed tool call failed instead of leaving it pending forever", async () => {
+		// Regression test: a process killed after persisting the assistant's
+		// tool_use but before its result leaves `toolu_dangling` with a
+		// tool_execution_start replay and no matching toolResult message.
+		// `keepDanglingToolCalls` is what makes it replay at all (rather than
+		// being silently dropped) -- but Zed only clears a Pending tool-call
+		// card on cancel/error, never at normal turn end, so leaving it as
+		// `pending` spins forever. It must resolve to `failed`.
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "run something", timestamp: Date.now() });
+		stored.sessionManager.appendMessage({
+			role: "assistant",
+			content: [
+				{ type: "tool_use", id: "toolu_dangling", name: "bash", input: { command: "sleep 100" } },
+			] as unknown as Array<{ type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }>,
+			api: "openai-responses",
+			provider: "openai",
+			model: TEST_MODELS[1].id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		const toolUpdates = harness.updates
+			.filter(update => update.sessionId === stored.sessionId)
+			.map(notification => notification.update)
+			.filter(
+				(update): update is Extract<typeof update, { toolCallId: string }> =>
+					"toolCallId" in update && update.toolCallId === "toolu_dangling",
+			);
+		expect(toolUpdates.at(-1)).toEqual(expect.objectContaining({ status: "failed" }));
+		expect(toolUpdates.some(update => update.sessionUpdate === "tool_call" && update.status === "pending")).toBe(
+			true,
+		);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("does not synthesize a failed update for a tool call that already resolved", async () => {
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "read a file", timestamp: Date.now() });
+		stored.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "toolCall", id: "toolu_resolved", name: "read", arguments: { path: "foo.ts" } }],
+			api: "openai-responses",
+			provider: "openai",
+			model: TEST_MODELS[1].id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		stored.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_resolved",
+			toolName: "read",
+			content: [{ type: "text", text: "file contents" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		const toolUpdates = harness.updates
+			.filter(update => update.sessionId === stored.sessionId)
+			.map(notification => notification.update)
+			.filter(
+				(update): update is Extract<typeof update, { toolCallId: string }> =>
+					"toolCallId" in update && update.toolCallId === "toolu_resolved",
+			);
+		expect(toolUpdates.some(update => "status" in update && update.status === "failed")).toBe(false);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("does not replay silent-abort marker as agent_message_chunk to ACP clients", async () => {
 		const harness = await createHarness();
 		const stored = new FakeAgentSession(harness.cwdA);
