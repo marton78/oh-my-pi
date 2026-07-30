@@ -85,6 +85,7 @@ import {
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
+	wantsMetaTerminal,
 } from "./acp-event-mapper";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
@@ -2064,6 +2065,13 @@ export class AcpAgent implements Agent {
 		// client's eyes — the cleanup loop below must never synthesize a
 		// `tool_call_update` for a `toolCallId` the client was never told about.
 		const announcedToolCallIds = new Set<string>();
+		// toolCallId -> toolName for every id in `announcedToolCallIds`, so the
+		// dangling-cleanup loop below knows whether a stuck call registered a
+		// display-only meta terminal (`wantsMetaTerminal`) at its `tool_call`
+		// start and therefore owes that terminal a matching `terminal_exit` —
+		// otherwise the embedded terminal card is left permanently unterminated
+		// even though the tool call itself is marked `failed`.
+		const announcedToolNames = new Map<string, string>();
 		// Ids that reached a persisted `toolResult` message during replay. Any
 		// id left in `announcedToolCallIds` but not here was started (assistant
 		// turn persisted) but never finished — the process was killed before
@@ -2090,6 +2098,7 @@ export class AcpAgent implements Agent {
 				replayedToolCallIds,
 				replayedToolCallArgs,
 				announcedToolCallIds,
+				announcedToolNames,
 				resolvedToolCallIds,
 			)) {
 				await this.#connection.sessionUpdate(notification);
@@ -2108,6 +2117,15 @@ export class AcpAgent implements Agent {
 		// without a permanent spinner.
 		for (const toolCallId of announcedToolCallIds) {
 			if (resolvedToolCallIds.has(toolCallId)) continue;
+			const toolName = announcedToolNames.get(toolCallId);
+			// A dangling call that registered a display-only meta terminal at its
+			// `tool_call` start (see `buildToolCallStartUpdate`) owes that terminal
+			// a `terminal_exit` — without one Zed's embedded terminal card stays
+			// open forever even though the tool call itself now reads `failed`.
+			const metaTerminalExit =
+				toolName && wantsMetaTerminal(toolName, { terminalMetaCapable: this.#terminalMetaCapable() })
+					? { terminal_exit: { terminal_id: toolCallId, exit_code: null, signal: null } }
+					: undefined;
 			await this.#connection.sessionUpdate({
 				sessionId: record.session.sessionId,
 				update: {
@@ -2120,6 +2138,7 @@ export class AcpAgent implements Agent {
 							content: { type: "text", text: "Interrupted: no result recorded before the process ended." },
 						},
 					],
+					...(metaTerminalExit ? { _meta: metaTerminalExit } : {}),
 				},
 			});
 		}
@@ -2132,6 +2151,7 @@ export class AcpAgent implements Agent {
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
 		announcedToolCallIds: Set<string>,
+		announcedToolNames: Map<string, string>,
 		resolvedToolCallIds: Set<string>,
 	): SessionNotification[] {
 		if (message.role === "assistant") {
@@ -2142,6 +2162,7 @@ export class AcpAgent implements Agent {
 				replayedToolCallIds,
 				replayedToolCallArgs,
 				announcedToolCallIds,
+				announcedToolNames,
 			);
 		}
 		if (
@@ -2199,6 +2220,7 @@ export class AcpAgent implements Agent {
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
 		announcedToolCallIds: Set<string>,
+		announcedToolNames: Map<string, string>,
 	): SessionNotification[] {
 		const notifications: SessionNotification[] = [];
 		const messageId = crypto.randomUUID();
@@ -2283,6 +2305,7 @@ export class AcpAgent implements Agent {
 					replayedToolCallArgs.set(toolItem.id, args);
 					if (startNotifications.length > 0) {
 						announcedToolCallIds.add(toolItem.id);
+						announcedToolNames.set(toolItem.id, toolItem.name);
 					}
 				}
 			}

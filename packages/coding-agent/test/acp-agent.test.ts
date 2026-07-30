@@ -1544,6 +1544,71 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("sends terminal_exit alongside the failed status for a dangling meta-terminal replay", async () => {
+		// Regression test: a dangling `eval`/`bash` call under the display-only
+		// meta-terminal convention (`_meta.terminal_output` client capability)
+		// registers `terminal_info` at its replayed `tool_call` start. The prior
+		// fix only changed the tool call's `status` to `failed` on cleanup and
+		// never sent the matching `terminal_exit`, leaving the embedded terminal
+		// card permanently unterminated even though the call itself reads failed.
+		const harness = await createHarness();
+		await harness.agent.initialize({
+			protocolVersion: 1,
+			clientCapabilities: { _meta: { terminal_output: true } },
+		} as Parameters<typeof harness.agent.initialize>[0]);
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "run something", timestamp: Date.now() });
+		stored.sessionManager.appendMessage({
+			role: "assistant",
+			content: [
+				{ type: "tool_use", id: "toolu_dangling_meta", name: "eval", input: { cells: [] } },
+			] as unknown as Array<{ type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }>,
+			api: "openai-responses",
+			provider: "openai",
+			model: TEST_MODELS[1].id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		const toolUpdates = harness.updates
+			.filter(update => update.sessionId === stored.sessionId)
+			.map(notification => notification.update)
+			.filter(
+				(update): update is Extract<typeof update, { toolCallId: string }> =>
+					"toolCallId" in update && update.toolCallId === "toolu_dangling_meta",
+			);
+		const failedUpdate = toolUpdates.at(-1) as {
+			status?: string;
+			_meta?: { terminal_exit?: { terminal_id: string; exit_code: number | null; signal: null } };
+		};
+		expect(failedUpdate.status).toBe("failed");
+		expect(failedUpdate._meta?.terminal_exit).toEqual({
+			terminal_id: "toolu_dangling_meta",
+			exit_code: null,
+			signal: null,
+		});
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("does not synthesize a failed update for a dangling internal Hub call", async () => {
 		// Regression test: an internal Hub coordination call
 		// (`isInternalHubMessageTool`) never gets a `tool_call` notification --
