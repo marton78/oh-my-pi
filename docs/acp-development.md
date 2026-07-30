@@ -80,9 +80,21 @@ sent for the tool call you're working on before changing (or writing) any mapper
 - Match `claude-agent-acp`'s exact content-array composition per tool kind (e.g. a live
   terminal's content is `[{type: "terminal", terminalId}]` **exclusively** — never mixed
   with a text echo of the same command/output).
-- Treat `terminal`-bearing content as exclusive of duplicate text; only add non-duplicate,
-  out-of-band facts (e.g. a framework-level `errorMessage` not shown by the terminal)
-  alongside it.
+- A terminal-bearing tool call's `content` array is a dead letterbox for anything
+  besides the terminal item itself in the live card: Zed's `has_terminals`
+  (`thread_view.rs`) renders it *exclusively* through the terminal renderer,
+  silently dropping every sibling `content` item (text, including a framework-level
+  `errorMessage`) from what the user sees while working. Those sibling items only
+  resurface via "Copy as Markdown"/thread export (`ToolCall::to_markdown`, which
+  walks `content` unconditionally) — never rely on them for live-card UX. For a
+  real, client-owned terminal, deliver extra facts (exit code, truncation, an
+  artifact pointer) by appending `_meta.terminal_output` bytes keyed by that
+  *same* terminal id instead — Zed's `on_terminal_provider_event`
+  (`agent_servers/acp.rs`) writes `terminal_output` straight into whatever
+  terminal buffer already owns that id, real or display-only, so it renders in
+  the live card and the markdown export identically, with no duplicate delivery
+  path to keep in sync (see `buildLiveTerminalNoticeMeta` in
+  `acp-event-mapper.ts`).
 - Wrap command/tool output in a fenced code block (` ```lang ... ``` `) whenever a client
   might lack terminal support and would otherwise render raw output as Markdown (`#` lines
   becoming headings, etc.).

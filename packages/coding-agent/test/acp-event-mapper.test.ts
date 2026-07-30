@@ -1126,7 +1126,16 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
-	it("surfaces detail notices the live terminal cannot show", () => {
+	it("delivers live-terminal notices through _meta.terminal_output instead of dead sibling content", () => {
+		// Regression test: Zed's `has_terminals` (`thread_view.rs`) renders a
+		// terminal-bearing tool call exclusively through the terminal card,
+		// silently dropping every other `content` item in the live view — the
+		// prior sibling-`content` notices block never actually reached a Zed
+		// user watching the card live (only "Copy as Markdown" export, via
+		// `ToolCall::to_markdown`, which walks `content` unconditionally).
+		// Notices must instead ride as extra `_meta.terminal_output` bytes on
+		// the same real terminal id, which Zed's `on_terminal_provider_event`
+		// appends straight into that terminal's own buffer.
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -1147,17 +1156,16 @@ describe("ACP event mapper", () => {
 
 		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as { content?: unknown };
-		// The terminal shows the process byte stream; the truncation/artifact
-		// pointer and exit code are synthesized after it and would be lost with
-		// the raw-output text block.
-		expect(update.content).toEqual([
-			{ type: "terminal", terminalId: "term-1" },
-			{
-				type: "content",
-				content: { type: "text", text: "Command exited with code 1\n[raw output: artifact://7]" },
-			},
-		]);
+		const update = updates[0]!.update as {
+			content?: unknown;
+			_meta?: { terminal_output?: { terminal_id: string; data: string } };
+		};
+		// No dead sibling text block — only the terminal reference.
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
+		expect(update._meta?.terminal_output).toEqual({
+			terminal_id: "term-1",
+			data: "\nCommand exited with code 1\n[raw output: artifact://7]\n",
+		});
 	});
 
 	it("renders recorded output as text when the terminal id is not live", () => {

@@ -406,6 +406,20 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				if (content.length > 0) {
 					update.content = content;
 				}
+				// `details.notices` (bash's exit code/wall-time/truncation/artifact
+				// notes) can't ride as sibling `content` next to a real live
+				// terminal — Zed's `has_terminals` (`thread_view.rs`) renders it
+				// exclusively through the terminal card, dropping every other
+				// `content` item from the live view (see `extractToolCallContent`).
+				// Append them as extra `_meta.terminal_output` bytes on this same
+				// terminal id instead: Zed's `on_terminal_provider_event`
+				// (`agent_servers/acp.rs`) writes `_meta.terminal_output` straight
+				// into whatever terminal buffer already owns that id, so this
+				// genuinely renders inside the live card instead of vanishing.
+				const liveTerminalNoticeMeta = buildLiveTerminalNoticeMeta(event.result, options);
+				if (liveTerminalNoticeMeta) {
+					update._meta = liveTerminalNoticeMeta;
+				}
 			}
 			const locations = extractToolLocationsFromResult(event.result, options.cwd);
 			if (locations.length > 0) {
@@ -1248,17 +1262,26 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 		// duplicating that as plain-text content gets markdown-rendered (`#`
 		// lines read as headings) and hides the terminal's own collapse control
 		// behind a redundant card. Keep non-text content (e.g. images) since
-		// that isn't otherwise represented in the terminal. What the terminal
-		// cannot show still surfaces here, unfenced: `details.notices` (exit
-		// code, truncation marker, `[raw output: artifact://N]` pointer) and a
-		// framework-level `errorMessage`/`message` note (e.g. "Permission
-		// request cancelled") are not part of the raw command output.
+		// that isn't otherwise represented in the terminal.
+		//
+		// `details.notices` (exit code, truncation marker, `[raw output:
+		// artifact://N]` pointer) is deliberately NOT added here as sibling
+		// `content`: Zed's `has_terminals` (`thread_view.rs`) renders a
+		// terminal-bearing tool call exclusively through the terminal card,
+		// silently dropping every other `content` item from the live view (it
+		// only resurfaces via "Copy as Markdown"/thread export, which walks
+		// `content` unconditionally regardless of a sibling terminal). The
+		// caller (`tool_execution_end`'s non-meta-terminal branch) instead
+		// appends notices as extra `_meta.terminal_output` bytes keyed by this
+		// *same* real terminal id — Zed's `on_terminal_provider_event`
+		// (`agent_servers/acp.rs`) writes `_meta.terminal_output` straight into
+		// whatever terminal buffer already owns that id, real or
+		// display-only, so the notices genuinely render inside the live
+		// terminal card instead of being dropped.
 		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
-		const withTerminal = hasTerminalContent(nonTextContent, terminalId)
+		const content = hasTerminalContent(nonTextContent, terminalId)
 			? nonTextContent
 			: [...nonTextContent, terminalToolCallContent(terminalId)];
-		const notices = extractDetailsNotices(value);
-		const content = notices ? [...withTerminal, textToolCallContent(notices)] : withTerminal;
 		const directText = extractDirectText(value);
 		if (!directText || hasEquivalentTextContent(content, directText)) {
 			return content;
@@ -1533,9 +1556,9 @@ function hasTerminalContent(content: ToolCallContent[], terminalId: string): boo
 
 /**
  * `details.notices`: notes a tool appended after its raw output (exit code,
- * wall time, truncation marker, `[raw output: artifact://N]` pointer). A client
- * terminal renders only the process byte stream, so these have to be re-emitted
- * beside it or they go out with the raw-output text block.
+ * wall time, truncation marker, `[raw output: artifact://N]` pointer). Only
+ * `bash`/`shell`/`exec` populate this. The caller decides how to deliver it —
+ * for a real live terminal, see `buildLiveTerminalNoticeMeta`.
  */
 function extractDetailsNotices(value: unknown): string | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
@@ -1545,6 +1568,30 @@ function extractDetailsNotices(value: unknown): string | undefined {
 	if (!Array.isArray(notices)) return undefined;
 	const lines = notices.filter((notice): notice is string => typeof notice === "string" && notice.length > 0);
 	return lines.length > 0 ? normalizeText(lines.join("\n")) : undefined;
+}
+
+/**
+ * `_meta.terminal_output` for a real, client-owned live terminal (as opposed
+ * to the display-only meta-terminal convention in `buildMetaTerminalDelta`).
+ * Zed's `on_terminal_provider_event` (`agent_servers/acp.rs`) writes
+ * `terminal_output` bytes straight into whatever terminal buffer already owns
+ * that id — real or display-only — so this is a one-shot append of
+ * `details.notices` onto the *same* terminal id the live command already
+ * used, landing inside the same card the process output rendered in (and its
+ * "Copy as Markdown" export) instead of a sibling `content` item Zed's
+ * `has_terminals` gate would silently drop. Only ever called once, from
+ * `tool_execution_end` — there is no earlier point where bash's own notices
+ * (computed from the final result) exist to send.
+ */
+function buildLiveTerminalNoticeMeta(
+	value: unknown,
+	options: AcpEventMapperOptions,
+): { terminal_output: { terminal_id: string; data: string } } | undefined {
+	const terminalId = extractTerminalId(value);
+	if (!terminalId || !(options.isTerminalLive?.(terminalId) ?? true)) return undefined;
+	const notices = extractDetailsNotices(value);
+	if (!notices) return undefined;
+	return { terminal_output: { terminal_id: terminalId, data: `\n${notices}\n` } };
 }
 
 /**
