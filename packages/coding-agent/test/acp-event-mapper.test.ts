@@ -1991,6 +1991,112 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("does not diff a column-truncated final result against the raw watermark as a discontinuity (regression: false rollover resync)", () => {
+		// Wire capture: a long single-line eval output streams raw via
+		// tool_execution_update, but eval.ts's tool_execution_end result is a
+		// *display re-render* for the model — truncated per-line at
+		// `tools.maxColumn` (768 chars) with `details.meta.limits.
+		// columnTruncated` set. Diffing that re-render against the raw
+		// watermark via `deliveredOverlap` found zero overlap (the truncated
+		// line's suffix never matches the raw tail's), which fired the
+		// rollover-resync branch: a false "[terminal output discontinuity:
+		// earlier bytes were dropped]" notice plus a *re-send* of the
+		// (already-truncated) re-rendered text, even though every byte had
+		// already reached the client live. Neither must happen once a prefix
+		// has already streamed for this call.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		const raw = "A".repeat(30000);
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-column-truncated",
+				toolName: "eval",
+				args: { language: "python", code: "sys.stdout.write('A' * 30000)" },
+				partialResult: { content: [{ type: "text", text: raw }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const rendered = `${"A".repeat(768)}…`;
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-column-truncated",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: rendered }],
+					details: { meta: { limits: { columnTruncated: { maxColumn: 768 } } } },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		// No discontinuity notice, no re-sent body — only the terminal's
+		// lifecycle finalizing. Every byte the user sees was already
+		// delivered by the update above.
+		expect(end._meta).toEqual({
+			terminal_exit: { terminal_id: "tc-column-truncated", exit_code: 0, signal: null },
+		});
+	});
+
+	it("still surfaces bash's exit notices on a column-truncated final result instead of dropping them entirely", () => {
+		// Same hazard as above, but for bash: `details.notices` (wall time,
+		// artifact pointer) must still reach the client through _meta even
+		// though the truncated body itself is no longer re-diffed.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		const raw = "A".repeat(30000);
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-bash-column-truncated",
+				toolName: "bash",
+				args: { command: "head -c 30000 /dev/zero | tr '\\0' 'A'" },
+				partialResult: { content: [{ type: "text", text: raw }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const rendered = `${"A".repeat(768)}…\n\nWall time: 0.02 seconds\n\n[Some lines truncated to 768 chars]`;
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-bash-column-truncated",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: rendered }],
+					details: {
+						notices: ["Wall time: 0.02 seconds"],
+						meta: { limits: { columnTruncated: { maxColumn: 768 } } },
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-bash-column-truncated", data: "\nWall time: 0.02 seconds\n" },
+			terminal_exit: { terminal_id: "tc-bash-column-truncated", exit_code: 0, signal: null },
+		});
+	});
+
 	it("fuzz: deliveredOverlap matches a brute-force reference across randomized byte strings", () => {
 		// This function has been the single densest source of review findings
 		// in this subsystem (4096-byte trial cap, in-band NUL-separator
