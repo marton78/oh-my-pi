@@ -356,7 +356,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// dropped for it.
 				update.content = [
 					terminalToolCallContent(event.toolCallId),
-					...extractDetailsImageToolCallContent(event.result, options, []),
+					...extractMetaTerminalImageToolCallContent(event.result, options),
 				];
 				const finalOutput = extractTerminalStreamText(event.result) ?? extractReadableText(event.result) ?? "";
 				const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
@@ -1429,6 +1429,34 @@ function extractDetailsImageToolCallContent(
 		}
 		seen.add(key);
 		content.push(toolCallContent);
+	}
+	return content;
+}
+
+/**
+ * Images for the meta-terminal `tool_execution_end` branch (see
+ * `wantsMetaTerminal`). The terminal block replaces `content` wholesale, so
+ * any images the tool produced must be re-attached here or they vanish.
+ * `eval`'s actual final result carries images only in `result.content`
+ * (`toolResult(details).content([{type:"text",...}, ...images])` in
+ * `eval.ts`) — `details.images` is only ever populated on the *streaming*
+ * progress snapshots, never the terminal result — so both sources are
+ * checked and deduped against each other.
+ */
+function extractMetaTerminalImageToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
+	const detailsImageContent = extractDetailsImageToolCallContent(value, options, []);
+	const seen = new Set(detailsImageContent.map(imageContentKey).filter((key): key is string => key !== undefined));
+	const content: ToolCallContent[] = [...detailsImageContent];
+	const blocks = getContentBlocks(value);
+	if (blocks) {
+		for (const block of blocks) {
+			if (getContentType(block) !== "image") continue;
+			const toolCallContent = toToolCallContent(block, options, false);
+			const key = imageContentKey(toolCallContent);
+			if (!toolCallContent || !key || seen.has(key)) continue;
+			seen.add(key);
+			content.push(toolCallContent);
+		}
 	}
 	return content;
 }
