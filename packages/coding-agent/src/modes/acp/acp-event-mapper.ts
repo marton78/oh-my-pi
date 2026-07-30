@@ -965,7 +965,7 @@ function isCommandToolName(toolName: string): boolean {
  * convention must get the fenced-text fallback instead of a dangling,
  * unrenderable terminal reference.
  */
-function wantsMetaTerminal(toolName: string, options: AcpEventMapperOptions): boolean {
+export function wantsMetaTerminal(toolName: string, options: AcpEventMapperOptions): boolean {
 	if (!options.terminalMetaCapable) return false;
 	if (toolName === "eval") return true;
 	return isCommandToolName(toolName) && options.realTerminalCapable !== true;
