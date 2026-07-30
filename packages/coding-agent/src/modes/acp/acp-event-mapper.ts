@@ -855,23 +855,38 @@ function buildTerminalMetaOutputData(toolName: string, args: unknown, output: st
  * see `DEFAULT_MAX_BYTES` — exceeds that cap: `deliveredOverlap` then
  * returns 0, and the caller suppresses the rest of the stream including the
  * final `tool_execution_end` payload. Instead this runs in
- * O(sent.length + next.length) via the KMP failure function of
- * `next + "\0" + sent`: its last entry is the longest prefix of `next` that
- * is also a suffix of the combined string, which — since the separator byte
- * can never match either side — is exactly the longest suffix of `sent`
- * matching a prefix of `next`.
+ * O(sent.length + next.length): `next`'s own KMP failure function drives a
+ * matching automaton scanned once over `sent`'s characters, with no
+ * artificial separator between the two strings. An in-band delimiter byte
+ * (e.g. joining them as `next + "\0" + sent"`) is unsafe here — terminal
+ * output can genuinely contain `\0` (binary commands, `find -print0`), and
+ * a real NUL then collides with the separator, producing an overlap length
+ * that exceeds either input and corrupts the delta (see the >`next.length`
+ * regression test below).
  */
 function deliveredOverlap(sent: string, next: string): number {
-	if (sent.length === 0 || next.length === 0) return 0;
-	const combined = `${next}\u0000${sent}`;
-	const failure = new Uint32Array(combined.length);
-	for (let i = 1; i < combined.length; i++) {
+	const m = next.length;
+	if (sent.length === 0 || m === 0) return 0;
+	const failure = new Uint32Array(m);
+	for (let i = 1; i < m; i++) {
 		let j = failure[i - 1];
-		while (j > 0 && combined[i] !== combined[j]) j = failure[j - 1];
-		if (combined[i] === combined[j]) j++;
+		while (j > 0 && next[i] !== next[j]) j = failure[j - 1];
+		if (next[i] === next[j]) j++;
 		failure[i] = j;
 	}
-	return failure[combined.length - 1];
+	let k = 0;
+	for (let i = 0; i < sent.length; i++) {
+		const c = sent[i];
+		// `k === m` (a full match of `next` completed mid-scan) needs the same
+		// fallback as a literal mismatch: `next[m]` doesn't exist, and the
+		// longest-suffix answer we want is anchored at the *last* character of
+		// `sent`, not the first full match found.
+		while (k > 0 && (k === m || c !== next[k])) {
+			k = failure[k - 1];
+		}
+		if (c === next[k]) k++;
+	}
+	return k;
 }
 
 /**
