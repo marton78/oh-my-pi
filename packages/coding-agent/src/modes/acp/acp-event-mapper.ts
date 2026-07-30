@@ -20,7 +20,7 @@ interface MessageProgress {
 	thoughtEmitted: boolean;
 }
 
-interface AcpEventMapperOptions {
+export interface AcpEventMapperOptions {
 	getMessageId?: (message: unknown) => string | undefined;
 	getMessageProgress?: (message: unknown) => MessageProgress | undefined;
 	getToolArgs?: (toolCallId: string) => unknown;
@@ -1473,6 +1473,8 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 		// renderer choice, so a different compliant client might still render
 		// sibling text fine. Keep the old best-effort sibling append for it:
 		// strictly not worse than silently dropping the notices everywhere.
+		// `checkAcpUpdateInvariants`'s rule 7 is gated on `terminalMetaCapable`
+		// for exactly this reason — it must never flag this fallback branch.
 		const notices = options.terminalMetaCapable ? undefined : extractDetailsNotices(value);
 		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
 		const withTerminal = hasTerminalContent(nonTextContent, terminalId)

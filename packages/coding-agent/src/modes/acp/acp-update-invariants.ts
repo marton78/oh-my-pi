@@ -4,13 +4,16 @@
  * Two ACP invariants (`docs/acp-development.md` rules 7 and 9) are properties
  * of the *emitted frame*, not of any one code path that builds it:
  *
- * 1. A terminal-bearing `content` array renders exclusively through Zed's
- *    terminal card (`has_terminals` in `thread_view.rs`), silently dropping
- *    every sibling `content` item — so a terminal item must be the array's
- *    only item.
- * 2. An `_meta.terminal_*` extension key is meaningless (and actively
- *    misleading) to a client that never negotiated
- *    `clientCapabilities._meta.terminal_output` at `initialize`.
+ * 1. For a client that negotiated `clientCapabilities._meta.terminal_output`
+ *    (Zed always does — `agent_servers/acp.rs:757`), a terminal-bearing
+ *    `content` array renders exclusively through Zed's terminal card
+ *    (`has_terminals` in `conversation_view/thread_view.rs`), silently
+ *    dropping every sibling `content` item — so for that client the terminal
+ *    item must be the array's only item. A client that hasn't negotiated the
+ *    extension has no such renderer quirk (the ACP schema itself imposes no
+ *    exclusivity — `docs/protocol/v1/tool-calls.mdx`), so the mapper's
+ *    best-effort sibling-content fallback for that case is legitimate and
+ *    exempt from this rule.
  *
  * Both were previously enforced by remembering to grep, which is why each was
  * rediscovered several times over in review: the violating shape usually only
@@ -65,9 +68,9 @@ export function checkAcpUpdateInvariants(notification: SessionNotification, cont
 	}
 	const violations: string[] = [];
 	const toolCallId = update.toolCallId;
-
 	const content = update.content;
-	if (Array.isArray(content) && content.length > 1) {
+
+	if (context.terminalMetaCapable && Array.isArray(content) && content.length > 1) {
 		const terminalIds = content
 			.filter(item => item?.type === "terminal")
 			.map(item => (item.type === "terminal" ? item.terminalId : undefined));
@@ -79,9 +82,9 @@ export function checkAcpUpdateInvariants(notification: SessionNotification, cont
 				);
 			violations.push(
 				`tool call ${toolCallId} sends ${siblings.length} sibling content item(s) [${siblings.join(", ")}] ` +
-					`alongside terminal item(s) [${terminalIds.join(", ")}]; Zed's has_terminals renders the terminal ` +
-					`exclusively and drops the siblings. Deliver the extra facts as _meta.terminal_output bytes on the ` +
-					`same terminal id, or drop the terminal item and send ordinary content.`,
+					`alongside terminal item(s) [${terminalIds.join(", ")}] for a terminalMetaCapable client; Zed's ` +
+					`has_terminals renders the terminal exclusively and drops the siblings. Deliver the extra facts as ` +
+					`_meta.terminal_output bytes on the same terminal id instead.`,
 			);
 		}
 	}

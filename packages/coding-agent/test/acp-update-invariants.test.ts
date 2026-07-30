@@ -29,6 +29,22 @@ describe("checkAcpUpdateInvariants", () => {
 		expect(violations[0]).toContain("terminal item(s) [term-1]");
 	});
 
+	it("exempts the sibling-content fallback for a client that hasn't negotiated terminal_output", () => {
+		// oh-my-pi/oh-my-pi#7078 review 4821242767: `acp-event-mapper.ts` keeps a
+		// best-effort `[terminal, content]` sibling append for a real-terminal
+		// client that never negotiated Zed's `_meta.terminal_output` extension —
+		// `has_terminals` (Zed's exclusivity renderer quirk) doesn't apply to
+		// that client, so rule 7 must not fire here.
+		const notification = toolCallUpdate({
+			content: [
+				{ type: "terminal", terminalId: "term-1" },
+				{ type: "content", content: { type: "text", text: "exit code 0" } },
+			],
+		});
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: false })).toEqual([]);
+	});
+
 	it("allows a terminal item with no siblings", () => {
 		const notification = toolCallUpdate({ content: [{ type: "terminal", terminalId: "term-1" }] });
 
