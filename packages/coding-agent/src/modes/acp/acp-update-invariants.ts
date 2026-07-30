@@ -58,10 +58,7 @@ export function getStrictAcpInvariantsForTesting(): boolean {
  * Describe every invariant violation in `notification`, or an empty array when
  * it is well-formed. Pure — never mutates the notification.
  */
-export function checkAcpUpdateInvariants(
-	notification: SessionNotification,
-	context: AcpInvariantContext,
-): string[] {
+export function checkAcpUpdateInvariants(notification: SessionNotification, context: AcpInvariantContext): string[] {
 	const update = notification.update;
 	if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
 		return [];
@@ -77,7 +74,9 @@ export function checkAcpUpdateInvariants(
 		if (terminalIds.length > 0) {
 			const siblings = content
 				.filter(item => item?.type !== "terminal")
-				.map(item => (item?.type === "content" ? `content/${item.content?.type ?? "unknown"}` : item?.type ?? "unknown"));
+				.map(item =>
+					item?.type === "content" ? `content/${item.content?.type ?? "unknown"}` : (item?.type ?? "unknown"),
+				);
 			violations.push(
 				`tool call ${toolCallId} sends ${siblings.length} sibling content item(s) [${siblings.join(", ")}] ` +
 					`alongside terminal item(s) [${terminalIds.join(", ")}]; Zed's has_terminals renders the terminal ` +

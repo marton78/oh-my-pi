@@ -7,7 +7,7 @@ import type {
 	ToolKind,
 } from "@agentclientprotocol/sdk";
 import { logger } from "@oh-my-pi/pi-utils";
-import { parseEditTargetPath } from "../../edit";
+import { type EditToolDetails, type EditToolPerFileResult, parseEditTargetPath } from "../../edit";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { formatOutputNotice, type OutputMeta } from "../../tools/output-meta";
@@ -149,6 +149,10 @@ interface ErrorMessageContainer {
 
 interface MessageContainer {
 	message?: unknown;
+}
+
+interface PerFileResultsContainer {
+	perFileResults?: unknown;
 }
 
 interface ResourceLinkLikeContent extends TypedValue {
@@ -1228,22 +1232,32 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
 	return locations;
 }
 
+/**
+ * Narrow a tool result's `details` to `EditToolDetails`, validating
+ * `perFileResults` is an array when present. `unknown` at the boundary is
+ * unavoidable — arbitrary/MCP tool results have no such shape — but every
+ * edit-result consumer below shares this one cast instead of re-deriving its
+ * own `{ perFileResults?: unknown }` view of the same field.
+ */
+function asEditDetails(result: unknown): EditToolDetails | undefined {
+	if (typeof result !== "object" || result === null) return undefined;
+	const details = (result as DetailsContainer).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const perFileResults = (details as PerFileResultsContainer).perFileResults;
+	if (perFileResults !== undefined && !Array.isArray(perFileResults)) return undefined;
+	return details as EditToolDetails;
+}
+
 /** Pull locations from a tool result's details (e.g. EditToolDetails.perFileResults[].path). */
 function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCallLocation[] {
-	if (typeof result !== "object" || result === null) return [];
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return [];
+	const details = asEditDetails(result);
+	if (!details) return [];
 	const direct = extractToolLocations(details, cwd);
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
-	if (!Array.isArray(perFile)) {
-		return direct;
-	}
+	if (!details.perFileResults) return direct;
 	const seen = new Set(direct.map(loc => loc.path));
 	const locations = [...direct];
-	for (const entry of perFile) {
-		const raw = extractStringProperty<PathContainer>(entry, "path");
-		if (!raw) continue;
-		const path = toAcpLocationPath(raw, cwd);
+	for (const entry of details.perFileResults) {
+		const path = toAcpLocationPath(entry.path, cwd);
 		if (seen.has(path)) continue;
 		seen.add(path);
 		locations.push({ path });
@@ -1253,12 +1267,10 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 
 /** Emit a `diff` ToolCallContent for each per-file edit result that carries oldText/newText. */
 function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
-	if (typeof result !== "object" || result === null) return [];
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return [];
+	const details = asEditDetails(result);
+	if (!details) return [];
+	const entries: (EditToolPerFileResult | EditToolDetails)[] = details.perFileResults ?? [details];
 	const blocks: ToolCallContent[] = [];
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
-	const entries: unknown[] = Array.isArray(perFile) ? perFile : [details];
 	for (const entry of entries) {
 		const block = buildDiffContent(entry);
 		if (block) blocks.push(block);
@@ -1274,33 +1286,19 @@ function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
  * skipped-after-failure file apart from one that was never part of the edit.
  */
 function extractEditFailureText(result: unknown): string | undefined {
-	if (typeof result !== "object" || result === null) return undefined;
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return undefined;
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
-	if (!Array.isArray(perFile)) return undefined;
+	const details = asEditDetails(result);
+	if (!details?.perFileResults) return undefined;
 	const lines: string[] = [];
-	for (const entry of perFile) {
-		if (typeof entry !== "object" || entry === null) continue;
-		const candidate = entry as {
-			path?: unknown;
-			isError?: unknown;
-			errorText?: unknown;
-			displayErrorText?: unknown;
-		};
-		if (candidate.isError !== true) continue;
-		const message =
-			(typeof candidate.displayErrorText === "string" && candidate.displayErrorText) ||
-			(typeof candidate.errorText === "string" && candidate.errorText) ||
-			undefined;
+	for (const entry of details.perFileResults) {
+		if (entry.isError !== true) continue;
+		const message = entry.displayErrorText || entry.errorText;
 		if (!message) continue;
-		const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
+		const path = entry.path.length > 0 ? entry.path : undefined;
 		lines.push(path ? `Error editing ${path}: ${message}` : message);
 	}
 	if (lines.length === 0) return undefined;
-	const unattemptedPaths = "unattemptedPaths" in details ? details.unattemptedPaths : undefined;
-	if (Array.isArray(unattemptedPaths) && unattemptedPaths.length > 0) {
-		const paths = unattemptedPaths.filter((p): p is string => typeof p === "string" && p.length > 0);
+	if (Array.isArray(details.unattemptedPaths) && details.unattemptedPaths.length > 0) {
+		const paths = details.unattemptedPaths.filter((p): p is string => typeof p === "string" && p.length > 0);
 		if (paths.length > 0) {
 			lines.push(
 				`Files NOT applied: ${paths.join(", ")}; re-read the affected files and re-issue only the failed and unapplied files.`,
@@ -1323,18 +1321,13 @@ function extractEditFailureText(result: unknown): string | undefined {
  * that still has room for its own snapshot never reaches this path.
  */
 function extractPrunedEditPathsText(result: unknown): string | undefined {
-	if (typeof result !== "object" || result === null) return undefined;
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return undefined;
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
-	if (!Array.isArray(perFile)) return undefined;
+	const details = asEditDetails(result);
+	if (!details?.perFileResults) return undefined;
 	const paths: string[] = [];
-	for (const entry of perFile) {
-		if (typeof entry !== "object" || entry === null) continue;
-		const candidate = entry as { path?: unknown; isError?: unknown; snapshotsPruned?: unknown };
-		if (candidate.isError === true || candidate.snapshotsPruned !== true) continue;
+	for (const entry of details.perFileResults) {
+		if (entry.isError === true || entry.snapshotsPruned !== true) continue;
 		if (buildDiffContent(entry)) continue;
-		if (typeof candidate.path === "string" && candidate.path.length > 0) paths.push(candidate.path);
+		if (entry.path.length > 0) paths.push(entry.path);
 	}
 	if (paths.length === 0) return undefined;
 	return `Also applied (diff omitted: file snapshot too large): ${paths.join(", ")}`;
@@ -1357,9 +1350,8 @@ function extractPrunedEditPathsText(result: unknown): string | undefined {
  * notices, and dedupe against the aggregate in case the two ever coincide.
  */
 function extractOutputNoticeText(result: unknown): string | undefined {
-	if (typeof result !== "object" || result === null) return undefined;
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return undefined;
+	const details = asEditDetails(result);
+	if (!details) return undefined;
 	const notices: string[] = [];
 	const seen = new Set<string>();
 	const pushNotice = (meta: OutputMeta | undefined, path: string | undefined) => {
@@ -1368,33 +1360,28 @@ function extractOutputNoticeText(result: unknown): string | undefined {
 		seen.add(notice);
 		notices.push(path ? `${path}: ${notice}` : notice);
 	};
-	pushNotice((details as { meta?: OutputMeta }).meta, undefined);
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
-	if (Array.isArray(perFile)) {
-		for (const entry of perFile) {
-			if (typeof entry !== "object" || entry === null) continue;
-			const candidate = entry as { path?: unknown; meta?: OutputMeta };
-			const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
-			pushNotice(candidate.meta, path);
-		}
+	pushNotice(details.meta, undefined);
+	for (const entry of details.perFileResults ?? []) {
+		pushNotice(entry.meta, entry.path.length > 0 ? entry.path : undefined);
 	}
 	return notices.length > 0 ? notices.join("\n\n") : undefined;
 }
 
-function buildDiffContent(entry: unknown): ToolCallContent | undefined {
-	if (typeof entry !== "object" || entry === null) return undefined;
-	const candidate = entry as { path?: unknown; oldText?: unknown; newText?: unknown; isError?: unknown };
-	if (candidate.isError === true) return undefined;
-	const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
+function buildDiffContent(entry: {
+	path?: string;
+	oldText?: string;
+	newText?: string;
+	isError?: boolean;
+}): ToolCallContent | undefined {
+	if (entry.isError === true) return undefined;
+	const path = entry.path && entry.path.length > 0 ? entry.path : undefined;
 	if (!path) return undefined;
-	const oldText = typeof candidate.oldText === "string" ? candidate.oldText : undefined;
-	const newText = typeof candidate.newText === "string" ? candidate.newText : undefined;
-	if (oldText === undefined && newText === undefined) return undefined;
+	if (entry.oldText === undefined && entry.newText === undefined) return undefined;
 	return {
 		type: "diff",
 		path,
-		oldText: oldText ?? null,
-		newText: newText ?? "",
+		oldText: entry.oldText ?? null,
+		newText: entry.newText ?? "",
 	};
 }
 
