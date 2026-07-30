@@ -1972,6 +1972,51 @@ describe("ACP event mapper", () => {
 		expect(update._meta).toBeUndefined();
 	});
 
+	it("computes overlap correctly when both strings contain a literal NUL byte", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4819970644): the prior
+		// `deliveredOverlap` joined `sent`/`next` with an in-band `"\0"`
+		// separator. Terminal output can genuinely contain NUL bytes (binary
+		// commands, `find -print0`), so a real NUL in the input collided with
+		// the separator: `sent = "a"`, `next = "\0a"` returned an overlap of 2
+		// despite the two strings sharing no actual overlap at all, corrupting
+		// the delta (`cumulativeOutput.slice(overlap)` sliced past the end).
+		// The sentinel-free KMP automaton must return the correct answer (no
+		// overlap) for this exact input.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-nul",
+				toolName: "bash",
+				args: { command: "echo hi" },
+				partialResult: { content: [{ type: "text", text: "a" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const update = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-nul",
+				toolName: "bash",
+				args: { command: "echo hi" },
+				partialResult: { content: [{ type: "text", text: "\0a" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		).at(0)!.update as { _meta?: { terminal_output?: { terminal_id: string; data: string } } };
+		// No real overlap between "a" and "\0a": the sentinel-free scan must
+		// report 0, not a corrupted (over-sliced) delta.
+		expect(update._meta).toBeUndefined();
+	});
+
 	it("emits no meta-terminal output on tool_execution_update when there is no partial output yet", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
