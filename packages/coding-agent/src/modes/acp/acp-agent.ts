@@ -172,6 +172,11 @@ type ManagedSessionRecord = {
 	liveMessageId: string | undefined;
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
+	// Cumulative meta-terminal output already delivered per tool call, so
+	// `mapAgentSessionEventToAcpSessionUpdates` can emit only the new bytes on
+	// each `tool_execution_update`/`tool_execution_end` instead of resending
+	// everything shown so far (see `AcpEventMapperOptions.getMetaTerminalSent`).
+	metaTerminalSent: Map<string, string>;
 	extensionsConfigured: boolean;
 	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
 	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
@@ -1157,6 +1162,7 @@ export class AcpAgent implements Agent {
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),
+			metaTerminalSent: new Map(),
 			extensionsConfigured: false,
 			closedError: undefined,
 			promptEventHandlers: new Set(),
@@ -1249,6 +1255,8 @@ export class AcpAgent implements Agent {
 			resolveImageData: resolveImageDataForAcp,
 			terminalMetaCapable: this.#terminalMetaCapable(),
 			realTerminalCapable: this.#clientCapabilities?.terminal === true,
+			getMetaTerminalSent: toolCallId => record.metaTerminalSent.get(toolCallId),
+			setMetaTerminalSent: (toolCallId, text) => record.metaTerminalSent.set(toolCallId, text),
 		})) {
 			const delivery = this.#connection.sessionUpdate(notification);
 			if (streamedAssistantError) {
@@ -1265,6 +1273,7 @@ export class AcpAgent implements Agent {
 		}
 		if (event.type === "tool_execution_end") {
 			record.toolArgsById.delete(event.toolCallId);
+			record.metaTerminalSent.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
 

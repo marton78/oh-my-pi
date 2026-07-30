@@ -1179,6 +1179,57 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("emits only the new bytes on tool_execution_end after a tool_execution_update already streamed a prefix", () => {
+		// Regression test: Zed appends `terminal_output.data` to the terminal's
+		// buffer rather than replacing it, so resending the full cumulative
+		// snapshot at both `tool_execution_update` and `tool_execution_end`
+		// duplicates every byte already streamed. `getMetaTerminalSent`/
+		// `setMetaTerminalSent` must be backed by the same state across both
+		// calls for the delta to be computed correctly.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		const updateUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-eval-delta",
+				toolName: "eval",
+				args: { language: "py", title: "hello", code: "print('hi')" },
+				partialResult: { content: [{ type: "text", text: "hi" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const update = updateUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(update._meta).toEqual({
+			terminal_output: { terminal_id: "tc-eval-delta", data: `print('hi')\n${"─".repeat(48)}\nhi` },
+		});
+
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-delta",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: "hi\nmore" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		// Only the newly-appended "\nmore" — never the "print('hi')" header or
+		// "hi" already delivered by the update above.
+		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-eval-delta", data: "\nmore" },
+			terminal_exit: { terminal_id: "tc-eval-delta", exit_code: 0, signal: null },
+		});
+	});
+
 	it("emits no meta-terminal output on tool_execution_update when there is no partial output yet", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
