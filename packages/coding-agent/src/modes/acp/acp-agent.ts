@@ -82,6 +82,7 @@ import {
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
+	buildTerminalMeta,
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
@@ -2166,10 +2167,13 @@ export class AcpAgent implements Agent {
 			const isMetaTerminal =
 				!!toolName && wantsMetaTerminal(toolName, undefined, { terminalMetaCapable: this.#terminalMetaCapable() });
 			const metaTerminalMeta = isMetaTerminal
-				? {
-						terminal_output: { terminal_id: toolCallId, data: `\n${explanation}\n` },
-						terminal_exit: { terminal_id: toolCallId, exit_code: null, signal: null },
-					}
+				? buildTerminalMeta(
+						{ terminalMetaCapable: this.#terminalMetaCapable() },
+						{
+							output: { terminal_id: toolCallId, data: `\n${explanation}\n` },
+							exit: { terminal_id: toolCallId, exit_code: null, signal: null },
+						},
+					)
 				: undefined;
 			await this.#sendUpdate({
 				sessionId: record.session.sessionId,

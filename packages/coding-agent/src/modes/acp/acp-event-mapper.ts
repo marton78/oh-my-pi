@@ -307,12 +307,9 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				if (partialText) {
 					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, event.args, partialText, options);
 					if (delta) {
-						update._meta = {
-							terminal_output: {
-								terminal_id: event.toolCallId,
-								data: delta,
-							},
-						};
+						update._meta = buildTerminalMeta(options, {
+							output: { terminal_id: event.toolCallId, data: delta },
+						});
 					}
 				}
 			} else {
@@ -365,13 +362,13 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					// update's `content` still references it — finalize its
 					// lifecycle so it doesn't linger as permanently "running" in
 					// Zed's own bookkeeping, even though it's no longer shown.
-					update._meta = {
-						terminal_exit: {
+					update._meta = buildTerminalMeta(options, {
+						exit: {
 							terminal_id: event.toolCallId,
 							exit_code: extractExitCode(event.result, event.isError),
 							signal: null,
 						},
-					};
+					});
 				} else {
 					// No live client-owned terminal exists for this call (see
 					// `wantsMetaTerminal`), so report the final output through the
@@ -382,14 +379,14 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					// resource reference.
 					update.content = [terminalToolCallContent(event.toolCallId)];
 					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
-					update._meta = {
-						...(delta !== undefined ? { terminal_output: { terminal_id: event.toolCallId, data: delta } } : {}),
-						terminal_exit: {
+					update._meta = buildTerminalMeta(options, {
+						...(delta !== undefined ? { output: { terminal_id: event.toolCallId, data: delta } } : {}),
+						exit: {
 							terminal_id: event.toolCallId,
 							exit_code: extractExitCode(event.result, event.isError),
 							signal: null,
 						},
-					};
+					});
 				}
 			} else {
 				const codeFence = shouldCodeFenceToolOutput(event.toolName);
@@ -665,6 +662,30 @@ function isTodoStatus(status: unknown): status is TodoStatus {
 		status === "blocked"
 	);
 }
+/**
+ * Single write site for the display-only terminal `_meta` extension
+ * (`terminal_info`/`terminal_output`/`terminal_exit` — see the "Do" rule on
+ * this convention in `docs/acp-development.md`). Returns `undefined` unless
+ * the client negotiated `terminalMetaCapable`, so an ungated `_meta.terminal_*`
+ * write is not expressible — every call site builds its object through this
+ * function instead of writing the keys directly (rule 9).
+ */
+export function buildTerminalMeta(
+	options: Pick<AcpEventMapperOptions, "terminalMetaCapable">,
+	parts: {
+		info?: { terminal_id: string; cwd?: string };
+		output?: { terminal_id: string; data: string };
+		exit?: { terminal_id: string; exit_code: number | null | undefined; signal: null };
+	},
+): Record<string, unknown> | undefined {
+	if (!options.terminalMetaCapable) return undefined;
+	return {
+		...(parts.info ? { terminal_info: parts.info } : {}),
+		...(parts.output ? { terminal_output: parts.output } : {}),
+		...(parts.exit ? { terminal_exit: parts.exit } : {}),
+	};
+}
+
 export function buildToolCallStartUpdate(
 	input: {
 		toolCallId: string;
@@ -690,12 +711,9 @@ export function buildToolCallStartUpdate(
 		// `tool_execution_end`, purely through `_meta` — no live client-owned
 		// terminal is ever created for this call.
 		update.content = [terminalToolCallContent(input.toolCallId)];
-		update._meta = {
-			terminal_info: {
-				terminal_id: input.toolCallId,
-				...(input.cwd ? { cwd: input.cwd } : {}),
-			},
-		};
+		update._meta = buildTerminalMeta(options, {
+			info: { terminal_id: input.toolCallId, ...(input.cwd ? { cwd: input.cwd } : {}) },
+		});
 	} else {
 		const content = buildToolStartContent(input.toolName, input.args);
 		if (content.length > 0) {
@@ -1746,7 +1764,7 @@ function extractDetailsNotices(value: unknown): string | undefined {
 function buildLiveTerminalNoticeMeta(
 	value: unknown,
 	options: AcpEventMapperOptions,
-): { terminal_output: { terminal_id: string; data: string } } | undefined {
+): Record<string, unknown> | undefined {
 	if (!options.terminalMetaCapable) return undefined;
 	const terminalId = extractTerminalId(value);
 	if (!terminalId || !(options.isTerminalLive?.(terminalId) ?? true)) return undefined;
@@ -1754,7 +1772,7 @@ function buildLiveTerminalNoticeMeta(
 	const directText = extractDirectText(value);
 	const combined = [notices, directText].filter((t): t is string => !!t).join("\n\n");
 	if (!combined) return undefined;
-	return { terminal_output: { terminal_id: terminalId, data: `\n${combined}\n` } };
+	return buildTerminalMeta(options, { output: { terminal_id: terminalId, data: `\n${combined}\n` } });
 }
 
 /**
