@@ -10,6 +10,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { type EditToolDetails, type EditToolPerFileResult, parseEditTargetPath } from "../../edit";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import { DEFAULT_MAX_BYTES } from "../../session/streaming-output";
 import { formatOutputNotice, type OutputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
@@ -1018,26 +1019,43 @@ function buildMetaTerminalDelta(
  * result is not guaranteed to be a byte-wise continuation of the raw stream
  * `tool_execution_update` delivered — `eval.ts` trims leading/trailing
  * whitespace off its final output, column truncation and head/tail elision
- * both re-render already-streamed lines — and there is no enumerable list
- * of every normalization a producer might apply. All of them are lossy
- * summaries: a display re-render can only shrink or preserve the raw bytes
- * already streamed, never exceed them. So instead of running the
- * literal-byte `deliveredOverlap` scan (which finds spurious partial
- * matches on self-similar output — repeated characters or lines coincide
- * with an unrelated tail by pure chance), a final snapshot no longer than
- * what already streamed is treated as "not a continuation" rather than
- * "bytes were lost": there is nothing left to resync for at the last
+ * both re-render already-streamed lines, and there is no enumerable list of
+ * every normalization a producer might apply.
+ *
+ * A display re-render can shrink OR grow relative to what already streamed:
+ * trimming/truncation shrink it, but `eval.ts` also *substitutes* `(no
+ * output)` for an all-whitespace stream and *appends* a synthesized
+ * `Command exited with code N` suffix after trimming — both grow the final
+ * text past the raw watermark's length without adding a single genuine
+ * process byte (oh-my-pi/oh-my-pi#7078 review 4823646245). So "final is
+ * longer than the watermark" is not proof of genuine new output the way
+ * "final is no longer than the watermark" is proof of a re-render — that
+ * asymmetry is exactly the bug: the shrink case is unconditionally treated
+ * as a re-render (below), but the grow case used to be unconditionally
+ * trusted as genuine, which fired a false discontinuity notice plus a
+ * duplicate re-send whenever the growth came from synthesis instead of the
+ * process.
+ *
+ * Shrink/equal: always a re-render — nothing left to resync for at the last
  * frame, so fabricating a "[terminal output discontinuity]" notice and
  * re-sending a re-rendered/truncated body would be pure noise on top of
- * what the user already watched stream live. Genuinely new facts (wall
- * time, an `artifact://` recovery pointer, a real truncation warning) still
- * ride through via `extractTerminalNotices` (`details.notices` plus the
- * same-source truncation notice a spilled `details.meta` carries), same as
- * `buildLiveTerminalNoticeMeta`. Falls through to the normal byte-diff path
- * whenever nothing has streamed yet for this call (first delivery has no
- * watermark to diverge from) or the final result is strictly longer than
- * what streamed — the only way that happens is genuine new output, so
- * `buildMetaTerminalDelta`'s overlap/rollover handling still applies.
+ * what the user already watched stream live.
+ *
+ * Grow: only trust it as a genuine continuation when `deliveredOverlap`
+ * finds a real suffix/prefix boundary, or when the streamed watermark is
+ * already large enough that the producer's own bounded tail buffer could
+ * plausibly have rolled forward (50 KB bash / 100 KB eval, `DEFAULT_MAX_BYTES`)
+ * — below that floor no tool's tail buffer can have dropped anything yet, so
+ * zero overlap on a short watermark can only be synthesis, not loss.
+ * Otherwise falls through to `buildMetaTerminalDelta`'s overlap/rollover
+ * handling, which still runs its own (fuzz-tested) resync check for a
+ * plausible mid-stream roll.
+ *
+ * Genuinely new facts (wall time, an `artifact://` recovery pointer, a real
+ * truncation warning) always ride through via `extractTerminalNotices`
+ * (`details.notices` plus the same-source truncation notice a spilled
+ * `details.meta` carries), same as `buildLiveTerminalNoticeMeta`, regardless
+ * of which branch below fires.
  */
 function buildFinalMetaTerminalDelta(
 	toolCallId: string,
@@ -1048,8 +1066,16 @@ function buildFinalMetaTerminalDelta(
 	options: AcpEventMapperOptions,
 ): string | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
-	if (prior === undefined || cumulativeOutput.length > prior.length) {
+	if (prior === undefined) {
 		return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
+	}
+	if (cumulativeOutput.length > prior.length) {
+		const rolloverFloorBytes = toolName === "eval" ? DEFAULT_MAX_BYTES * 2 : DEFAULT_MAX_BYTES;
+		const isPlausibleContinuation =
+			prior.length >= rolloverFloorBytes || deliveredOverlap(prior, cumulativeOutput) > 0;
+		if (isPlausibleContinuation) {
+			return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
+		}
 	}
 	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 	const notices = extractTerminalNotices(result);

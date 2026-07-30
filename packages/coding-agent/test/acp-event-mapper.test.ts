@@ -2294,6 +2294,134 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("does not report a discontinuity when eval substitutes '(no output)' for an all-whitespace stream", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4823646245): the prior
+		// fix (review 4820360199) only handled the final result being no
+		// *longer* than the watermark. `eval.ts` also substitutes `(no
+		// output)` for a stream that was all whitespace — final.length (11)
+		// now *exceeds* the raw watermark's length (4, "   \n"), which the
+		// growth branch unconditionally trusted as genuine new output. Zero
+		// overlap between "   \n" and "(no output)" then fired the same false
+		// discontinuity + duplicate re-send this whole mechanism exists to
+		// prevent — just via the grow side instead of the shrink side.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-whitespace-only",
+				toolName: "eval",
+				args: { language: "python", code: "print('   ')" },
+				partialResult: { content: [{ type: "text", text: "   \n" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-whitespace-only",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: "(no output)" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(end._meta).toEqual({
+			terminal_exit: { terminal_id: "tc-whitespace-only", exit_code: 0, signal: null },
+		});
+	});
+
+	it("does not report a discontinuity when a trailing-newline mismatch survives trimming plus a synthesized exit-code suffix", () => {
+		// Same class, via the other growth path Codex named: a nonzero eval's
+		// trimmed output gains a synthesized "Command exited with code N"
+		// suffix. The raw watermark's trailing newline count doesn't line up
+		// with the trimmed+suffixed final text, so `deliveredOverlap` finds
+		// zero even though the core content ("hello") is identical.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-trailing-newlines",
+				toolName: "eval",
+				args: { language: "python", code: "print('hello')" },
+				partialResult: { content: [{ type: "text", text: "hello\n\n\n" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-trailing-newlines",
+				toolName: "eval",
+				isError: true,
+				result: { content: [{ type: "text", text: "hello\n\nCommand exited with code 1" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		expect(end._meta).toEqual({
+			terminal_exit: { terminal_id: "tc-trailing-newlines", signal: null },
+		});
+	});
+
+	it("still diffs a genuine final-frame continuation whose growth overlaps the streamed watermark", () => {
+		// The fix above must not regress the legitimate case this mechanism
+		// exists to serve: real new bytes that only arrived in the final
+		// snapshot (no intervening tool_execution_update saw them). "hi" is a
+		// real suffix-of-watermark/prefix-of-final overlap, so this must
+		// still emit just the new bytes, not fall back to notices-only.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-genuine-tail-growth",
+				toolName: "eval",
+				args: { language: "python", code: "print('hi', end='')" },
+				partialResult: { content: [{ type: "text", text: "hi" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-genuine-tail-growth",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: "hi\nmore" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
+		expect(end._meta?.terminal_output?.data).toBe("\nmore");
+	});
+
 	it("does not diff a middle-elided final result against the raw watermark as a discontinuity", () => {
 		// Same class as the column-truncation case, via the other re-render
 		// mechanism named in review 4820560308: head/tail elision past the
