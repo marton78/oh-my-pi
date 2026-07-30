@@ -74,6 +74,23 @@ feature adoption alike. Read this before touching ACP code.
    caught at the emit chokepoint even if it bypasses `buildTerminalMeta` entirely. For a
    brand-new `_meta.*` extension unrelated to the terminal convention, add its own gate
    check to `checkAcpUpdateInvariants` rather than assuming rule 7's guard covers it.
+10. **A tool's `tool_execution_end` result is not always a raw continuation of
+   what `tool_execution_update` streamed — check before feeding it to a delta
+   diff.** `buildMetaTerminalDelta`/`buildFinalMetaTerminalDelta`
+   (`acp-event-mapper.ts`) assume the text handed in is more of the same
+   append-only byte stream. Several producers hand back a *display
+   re-render* instead: per-line truncation past `tools.maxColumn` (768 chars
+   by default — `details.meta.limits.columnTruncated`), or head/tail spill
+   elision past the artifact threshold (`details.meta.truncation`). Diffing
+   a re-render against the raw watermark via `deliveredOverlap` finds a
+   false zero overlap (a line truncated mid-stream rarely shares a
+   byte-for-byte suffix with the raw tail it replaced) and fires the
+   rollover-resync branch even though nothing was lost — a false
+   `discontinuity` notice plus a duplicate re-send of already-delivered
+   bytes. `buildFinalMetaTerminalDelta` checks `details.meta` for exactly
+   this before diffing anything, once a prefix has already streamed for the
+   call; any future producer-side reformatting of a final result needs the
+   same check, not a new diff heuristic.
 
 ## Running the probe against omp
 
@@ -104,7 +121,7 @@ a `prompt` there usually fails with `RequestError: Internal error (code=-32603)`
 reporting a real auth failure, not a probe bug; use `--isolate` for handshake/session
 probing only, never for a `prompt` that needs to actually reach a model.
 
-For rules 7–9's boundary/regression classes specifically, `acp-probe stress-output
+For rules 7–10's boundary/regression classes specifically, `acp-probe stress-output
 <bytes>` and `acp-probe kill-mid-tool <text...>` exercise them directly against a real
 `omp acp` process instead of by hand — see acp-probe's README for both.
 
