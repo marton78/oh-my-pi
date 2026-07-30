@@ -1,6 +1,6 @@
 import type { Agent, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
@@ -490,13 +490,6 @@ export class SessionTools {
 					if (!permissionIntent) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
-					const command =
-						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
-							? stringProperty(args, "command")
-							: undefined;
-					const commandContent = command
-						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
-						: undefined;
 					// Short-circuit on persisted decisions.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
@@ -524,7 +517,6 @@ export class SessionTools {
 								...(target.name === "bash" ? { kind: "execute" } : {}),
 								status: "pending",
 								rawInput: args,
-								...(commandContent ? { content: commandContent } : {}),
 								locations: extractPermissionLocations(
 									args,
 									this.#host.sessionManager.getCwd(),
