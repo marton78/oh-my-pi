@@ -1297,6 +1297,45 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
+	it("preserves eval-cell images when details.images is absent (real EvalTool result shape)", () => {
+		// Regression test: `EvalTool.execute`'s actual final `toolResult(details)`
+		// only ever puts images in `.content([{type:"text",...}, ...images])` —
+		// `details.images` is populated solely on the intermediate streaming
+		// snapshots (`buildUpdateDetails`), never the terminal result. The
+		// sibling test above fabricates `details.images` alongside `content` and
+		// so never exercised this — the real path lost every eval image once a
+		// client advertised `_meta.terminal_output`.
+		const imageData = "base64-image-data-2";
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-image-no-details",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [
+						{ type: "text", text: "(displayed 1 image; no text output)" },
+						{ type: "image", data: imageData, mimeType: "image/png" },
+					],
+					details: {},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "plt.show()" }) },
+		);
+		const end = endUpdates[0]!.update as {
+			content?: Array<{
+				type: string;
+				terminalId?: string;
+				content?: { type: string; data?: string; mimeType?: string };
+			}>;
+		};
+		expect(end.content).toEqual([
+			{ type: "terminal", terminalId: "tc-eval-image-no-details" },
+			{ type: "content", content: { type: "image", data: imageData, mimeType: "image/png" } },
+		]);
+	});
+
 	it("streams cumulative output through the meta-terminal convention on tool_execution_update", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
