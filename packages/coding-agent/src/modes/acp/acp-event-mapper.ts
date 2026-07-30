@@ -346,7 +346,17 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// `terminal_exit` shape, and (unlike a live terminal id) survives
 				// `session/load` replay verbatim since it carries no client-owned
 				// resource reference.
-				update.content = [terminalToolCallContent(event.toolCallId)];
+				// The terminal block itself can't render binary content (an eval
+				// cell's `display()`ed image lands in `details.images`, not the raw
+				// output stream) — Zed's `has_terminals` routes any tool call
+				// carrying a `terminal` item exclusively through the terminal
+				// renderer, but that only concerns *text* duplication; images are
+				// otherwise unrepresented and must ride alongside it, not be
+				// dropped for it.
+				update.content = [
+					terminalToolCallContent(event.toolCallId),
+					...extractDetailsImageToolCallContent(event.result, options, []),
+				];
 				const finalOutput = extractTerminalStreamText(event.result) ?? extractReadableText(event.result) ?? "";
 				const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
 				update._meta = {
