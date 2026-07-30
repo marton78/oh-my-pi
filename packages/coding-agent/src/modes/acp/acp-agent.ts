@@ -2064,6 +2064,14 @@ export class AcpAgent implements Agent {
 		const cwd = record.session.sessionManager.getCwd();
 		const replayedToolCallIds = new Set<string>();
 		const replayedToolCallArgs = new Map<string, unknown>();
+		// Ids that reached a persisted `toolResult` message during replay. Any
+		// id left in `replayedToolCallIds` but not here was started (assistant
+		// turn persisted) but never finished — the process was killed before
+		// its result landed. `keepDanglingToolCalls` (below) is what makes such
+		// a call replay at all instead of being silently dropped; see the
+		// synthesized `failed` update after the loop for why it can't stay
+		// `pending` forever.
+		const resolvedToolCallIds = new Set<string>();
 		// `buildSessionContext()` (the default) builds the *LLM* context: it
 		// collapses pre-compaction history behind a summary and silently strips
 		// tool calls left dangling by an interrupted/killed process (no
@@ -2081,9 +2089,38 @@ export class AcpAgent implements Agent {
 				cwd,
 				replayedToolCallIds,
 				replayedToolCallArgs,
+				resolvedToolCallIds,
 			)) {
 				await this.#connection.sessionUpdate(notification);
 			}
+		}
+		// `keepDanglingToolCalls` is only correct for a *live* stream, where the
+		// still-running call really will resolve later (see `ui-helpers.ts`'s
+		// `viewSession.isStreaming` gate for the TUI's equivalent). A loaded,
+		// no-longer-running session has no live execution left to finish a
+		// dangling call, but the mapper's `tool_execution_start` alone leaves
+		// Zed's card in `Pending` — a state Zed only ever clears on cancel or
+		// error (`acp_thread.rs`'s `mark_pending_entries_as_canceled`), never at
+		// normal turn end, so it would spin forever. ACP v1 has no `canceled`
+		// tool-call status, so `failed` is the terminal state available; this
+		// keeps the call visible (why `keepDanglingToolCalls` is used at all)
+		// without a permanent spinner.
+		for (const toolCallId of replayedToolCallIds) {
+			if (resolvedToolCallIds.has(toolCallId)) continue;
+			await this.#connection.sessionUpdate({
+				sessionId: record.session.sessionId,
+				update: {
+					sessionUpdate: "tool_call_update",
+					toolCallId,
+					status: "failed",
+					content: [
+						{
+							type: "content",
+							content: { type: "text", text: "Interrupted: no result recorded before the process ended." },
+						},
+					],
+				},
+			});
 		}
 	}
 
@@ -2093,6 +2130,7 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
+		resolvedToolCallIds: Set<string>,
 	): SessionNotification[] {
 		if (message.role === "assistant") {
 			return this.#replayAssistantMessage(sessionId, message, cwd, replayedToolCallIds, replayedToolCallArgs);
@@ -2115,6 +2153,7 @@ export class AcpAgent implements Agent {
 			typeof message.toolCallId === "string" &&
 			typeof message.toolName === "string"
 		) {
+			resolvedToolCallIds.add(message.toolCallId);
 			return this.#replayToolResult(
 				sessionId,
 				cwd,
