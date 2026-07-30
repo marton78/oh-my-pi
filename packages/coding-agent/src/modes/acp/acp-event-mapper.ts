@@ -864,7 +864,7 @@ function buildTerminalMetaOutputData(toolName: string, args: unknown, output: st
  * that exceeds either input and corrupts the delta (see the >`next.length`
  * regression test below).
  */
-function deliveredOverlap(sent: string, next: string): number {
+export function deliveredOverlap(sent: string, next: string): number {
 	const m = next.length;
 	if (sent.length === 0 || m === 0) return 0;
 	const failure = new Uint32Array(m);

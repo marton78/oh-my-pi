@@ -18,6 +18,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import {
 	buildToolCallStartUpdate,
+	deliveredOverlap,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
@@ -1988,6 +1989,113 @@ describe("ACP event mapper", () => {
 		expect(update._meta).toEqual({
 			terminal_output: { terminal_id: "tc-big-roll", data: "NEW_LINE_APPENDED" },
 		});
+	});
+
+	it("fuzz: deliveredOverlap matches a brute-force reference across randomized byte strings", () => {
+		// This function has been the single densest source of review findings
+		// in this subsystem (4096-byte trial cap, in-band NUL-separator
+		// collision, k===m fallback) — each caught by one hand-picked example
+		// at a time. A deterministic (seeded) fuzz loop against a trivial O(n^2)
+		// reference implementation covers the input space an example-based
+		// suite can't anticipate: NUL bytes, multi-byte unicode, and long
+		// runs of repeated characters (self-similar inputs are exactly where a
+		// KMP failure-function bug hides).
+		function mulberry32(seed: number): () => number {
+			let state = seed;
+			return () => {
+				state = (state + 0x6d2b79f5) | 0;
+				let t = state;
+				t = Math.imul(t ^ (t >>> 15), t | 1);
+				t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+				return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+			};
+		}
+		function bruteForceOverlap(sent: string, next: string): number {
+			const max = Math.min(sent.length, next.length);
+			for (let len = max; len > 0; len--) {
+				if (sent.slice(-len) === next.slice(0, len)) return len;
+			}
+			return 0;
+		}
+		const alphabet = ["\0", "a", "b", "\n", "🎉", "é"];
+		const rand = mulberry32(0x5eed);
+		const randomString = (maxLen: number): string => {
+			const len = Math.floor(rand() * maxLen);
+			let s = "";
+			for (let i = 0; i < len; i++) {
+				s += alphabet[Math.floor(rand() * alphabet.length)];
+			}
+			return s;
+		};
+		for (let trial = 0; trial < 500; trial++) {
+			const sent = randomString(60);
+			const next = randomString(60);
+			expect(deliveredOverlap(sent, next)).toBe(bruteForceOverlap(sent, next));
+		}
+	});
+
+	it("fuzz: buildMetaTerminalDelta's delivered stream always ends with the current producer window", () => {
+		// End-to-end simulation of a bounded tail buffer (like bash's/eval's
+		// real `TailBuffer`) streaming through the mapper across many random
+		// rollovers, including NUL bytes and unicode. Concatenating every
+		// `_meta.terminal_output.data` byte ever delivered for a tool call must
+		// always end with the producer's current visible window — the
+		// append-only contract `terminal_output.data` makes to the client
+		// (bytes can be appended, never replaced or erased). Breaking this
+		// invariant is exactly the corruption class the overlap/rollover/NUL
+		// findings kept re-discovering one fixed example at a time.
+		function mulberry32(seed: number): () => number {
+			let state = seed;
+			return () => {
+				state = (state + 0x6d2b79f5) | 0;
+				let t = state;
+				t = Math.imul(t ^ (t >>> 15), t | 1);
+				t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+				return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+			};
+		}
+		const alphabet = ["\0", "x", "y", "\n", "🎉"];
+		const rand = mulberry32(0xc0ffee);
+		for (let trial = 0; trial < 30; trial++) {
+			const windowSize = 40 + Math.floor(rand() * 150);
+			const sent = new Map<string, string>();
+			const options = {
+				terminalMetaCapable: true,
+				getMetaTerminalSent: (id: string) => sent.get(id),
+				setMetaTerminalSent: (id: string, text: string) => {
+					sent.set(id, text);
+				},
+			};
+			const toolCallId = `tc-fuzz-delta-${trial}`;
+			let trueOutput = "";
+			let delivered = "";
+			for (let step = 0; step < 40; step++) {
+				const chunkLen = 1 + Math.floor(rand() * 25);
+				let chunk = "";
+				for (let c = 0; c < chunkLen; c++) {
+					chunk += alphabet[Math.floor(rand() * alphabet.length)];
+				}
+				trueOutput += chunk;
+				// Simulates a bounded producer tail buffer: only the most recent
+				// `windowSize` chars survive in the snapshot the mapper sees.
+				const window = trueOutput.length > windowSize ? trueOutput.slice(-windowSize) : trueOutput;
+				const updates = mapAgentSessionEventToAcpSessionUpdates(
+					{
+						type: "tool_execution_update",
+						toolCallId,
+						toolName: "bash",
+						args: { command: "noisy fuzz command" },
+						partialResult: { content: [{ type: "text", text: window }], details: {} },
+					} as AgentSessionEvent,
+					"session-1",
+					options,
+				);
+				const data = (updates[0]!.update as { _meta?: { terminal_output?: { data: string } } })._meta
+					?.terminal_output?.data;
+				if (data) delivered += data;
+				expect(delivered.endsWith(window)).toBe(true);
+			}
+		}
 	});
 
 	it("bounds the delivered watermark instead of growing it across every tail-buffer roll", () => {
