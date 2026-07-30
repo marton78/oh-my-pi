@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
-import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import type { AgentSideConnection, SessionNotification, ToolCallContent } from "@agentclientprotocol/sdk";
 import { type } from "arktype";
 
 const arkSessionNotification = type({
@@ -1425,6 +1425,112 @@ describe("ACP event mapper", () => {
 		expect(update._meta).toBeUndefined();
 	});
 
+	it("recovers a spilled artifact pointer into _meta.terminal_output when bash's own notices omit it", () => {
+		// Regression test (oh-my-pi/oh-my-pi#7078 review 4821242767, finding 2):
+		// `bash.ts`'s `spilledArtifactId` is only populated inside
+		// `enforceInlineByteCap`'s own save callback, which no-ops once
+		// `OutputSink` already spilled the body under the inline cap — the
+		// ordinary, common spill path (confirmed live: a real BashTool run
+		// producing 76.5KB of output, spilled by the sink to a 51KB body,
+		// carries `details.notices: ["Wall time: …"]` with no artifact
+		// pointer at all, while `details.meta.truncation.artifactId` has it).
+		// A terminal-rendering client only ever sees `details.notices` (or
+		// its `_meta.terminal_output` mirror) — never the tool's own text —
+		// so without re-deriving the notice from `details.meta`, the
+		// recovery link and the "bytes were elided" acknowledgement vanish
+		// entirely for every large bash call. This is the same underlying gap
+		// as the "no acknowledgement when a producer silently drops bytes"
+		// follow-up flagged in oh-my-pi/oh-my-pi#7078's own PR thread.
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-spilled-meta",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "…truncated body…" }],
+					details: {
+						terminalId: "term-spilled",
+						notices: ["Wall time: 0.21 seconds"],
+						meta: {
+							truncation: {
+								direction: "middle",
+								truncatedBy: "middle",
+								totalLines: 1801,
+								totalBytes: 76500,
+								outputLines: 1207,
+								outputBytes: 51222,
+								headRange: { start: 1, end: 603 },
+								tailRange: { start: 1199, end: 1801 },
+								elidedBytes: 25300,
+								elidedLines: 595,
+								artifactId: "0",
+							},
+						},
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		);
+
+		expect(updates).toHaveLength(1);
+		const update = updates[0]!.update as {
+			content?: unknown;
+			_meta?: { terminal_output?: { terminal_id: string; data: string } };
+		};
+		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-spilled" }]);
+		expect(update._meta?.terminal_output?.data).toContain("Wall time: 0.21 seconds");
+		expect(update._meta?.terminal_output?.data).toContain("artifact://0");
+	});
+
+	it("recovers the same spilled artifact pointer as sibling content when the client hasn't negotiated the meta extension", () => {
+		// Same producer gap as above, for the fallback path a real-terminal
+		// client without `_meta.terminal_output` uses instead.
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-spilled-no-meta",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "…truncated body…" }],
+					details: {
+						terminalId: "term-spilled-2",
+						notices: ["Wall time: 0.21 seconds"],
+						meta: {
+							truncation: {
+								direction: "middle",
+								truncatedBy: "middle",
+								totalLines: 1801,
+								totalBytes: 76500,
+								outputLines: 1207,
+								outputBytes: 51222,
+								headRange: { start: 1, end: 603 },
+								tailRange: { start: 1199, end: 1801 },
+								elidedBytes: 25300,
+								elidedLines: 595,
+								artifactId: "0",
+							},
+						},
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: false },
+		);
+
+		expect(updates).toHaveLength(1);
+		const update = updates[0]!.update as { content?: ToolCallContent[]; _meta?: unknown };
+		expect(update._meta).toBeUndefined();
+		const textItem = update.content?.find(
+			(item): item is { type: "content"; content: { type: "text"; text: string } } =>
+				item.type === "content" && item.content.type === "text",
+		);
+		expect(textItem?.content.text).toContain("Wall time: 0.21 seconds");
+		expect(textItem?.content.text).toContain("artifact://0");
+	});
+
 	it("delivers a framework-level directText note through _meta.terminal_output instead of dead sibling content", () => {
 		// Regression test (oh-my-pi/oh-my-pi#7078 review 4819042330 follow-up
 		// audit): `extractDirectText` (a top-level `errorMessage`/`message`/
@@ -2070,9 +2176,16 @@ describe("ACP event mapper", () => {
 		);
 		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
 		// No discontinuity notice, no re-sent body — only the terminal's
-		// lifecycle finalizing. Every byte the user sees was already
-		// delivered by the update above.
+		// lifecycle finalizing plus the genuinely new fact
+		// (`details.meta.limits.columnTruncated`) that only the discarded final
+		// body carried; `extractTerminalNotices` recovers it instead of losing
+		// it the way `details.notices` alone would (finding 2, review
+		// 4821242767: a fact that exists only in `details.meta`/the tool's own
+		// text is invisible to the terminal-content path unless something
+		// re-derives it structurally).
+		const meta = { limits: { columnTruncated: { maxColumn: 768 } } };
 		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-column-truncated", data: `\n${formatOutputNotice(meta).trim()}\n` },
 			terminal_exit: { terminal_id: "tc-column-truncated", exit_code: 0, signal: null },
 		});
 	});
@@ -2080,7 +2193,10 @@ describe("ACP event mapper", () => {
 	it("still surfaces bash's exit notices on a column-truncated final result instead of dropping them entirely", () => {
 		// Same hazard as above, but for bash: `details.notices` (wall time,
 		// artifact pointer) must still reach the client through _meta even
-		// though the truncated body itself is no longer re-diffed.
+		// though the truncated body itself is no longer re-diffed — and so
+		// must `details.meta.limits.columnTruncated`, the genuine fact that
+		// was only otherwise visible in that same discarded body text
+		// (finding 2, review 4821242767).
 		const sent = new Map<string, string>();
 		const options = {
 			terminalMetaCapable: true,
@@ -2120,8 +2236,12 @@ describe("ACP event mapper", () => {
 			options,
 		);
 		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		const meta = { limits: { columnTruncated: { maxColumn: 768 } } };
 		expect(end._meta).toEqual({
-			terminal_output: { terminal_id: "tc-bash-column-truncated", data: "\nWall time: 0.02 seconds\n" },
+			terminal_output: {
+				terminal_id: "tc-bash-column-truncated",
+				data: `\nWall time: 0.02 seconds\n\n${formatOutputNotice(meta).trim()}\n`,
+			},
 			terminal_exit: { terminal_id: "tc-bash-column-truncated", exit_code: 0, signal: null },
 		});
 	});
@@ -2181,7 +2301,12 @@ describe("ACP event mapper", () => {
 		// elided body shares no byte-for-byte suffix with the raw streamed
 		// tail. The genuine facts (bytes were dropped by the *producer*, and
 		// where to recover them) travel as notices, not as a fabricated
-		// terminal-stream discontinuity.
+		// terminal-stream discontinuity. `meta.truncation.artifactId` matches
+		// the id `details.notices` already names (both name the same spill,
+		// bash.ts's own `[raw output: artifact://N]` push and the sink's own
+		// `truncationFromSummary` describing the same elision) —
+		// `extractTerminalNotices` must not restate it a second time in a
+		// different wording.
 		const sent = new Map<string, string>();
 		const options = {
 			terminalMetaCapable: true,
@@ -2211,7 +2336,21 @@ describe("ACP event mapper", () => {
 					content: [{ type: "text", text: `${"hello\n".repeat(100)}… [elided] …\n${"hello\n".repeat(100)}` }],
 					details: {
 						notices: ["(output truncated)", "[raw output: artifact://7]"],
-						meta: { truncation: { omittedBytes: 40000 } },
+						meta: {
+							truncation: {
+								direction: "middle",
+								truncatedBy: "middle",
+								totalLines: 20000,
+								totalBytes: 140000,
+								outputLines: 200,
+								outputBytes: 1400,
+								headRange: { start: 1, end: 100 },
+								tailRange: { start: 19901, end: 20000 },
+								elidedBytes: 40000,
+								elidedLines: 19700,
+								artifactId: "7",
+							},
+						},
 					},
 				},
 			} as AgentSessionEvent,

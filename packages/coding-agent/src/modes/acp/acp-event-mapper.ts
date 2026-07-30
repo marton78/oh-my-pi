@@ -1030,8 +1030,9 @@ function buildMetaTerminalDelta(
  * frame, so fabricating a "[terminal output discontinuity]" notice and
  * re-sending a re-rendered/truncated body would be pure noise on top of
  * what the user already watched stream live. Genuinely new facts (wall
- * time, an `artifact://` recovery pointer, a real truncation warning)
- * still ride through via `details.notices`, same convention as
+ * time, an `artifact://` recovery pointer, a real truncation warning) still
+ * ride through via `extractTerminalNotices` (`details.notices` plus the
+ * same-source truncation notice a spilled `details.meta` carries), same as
  * `buildLiveTerminalNoticeMeta`. Falls through to the normal byte-diff path
  * whenever nothing has streamed yet for this call (first delivery has no
  * watermark to diverge from) or the final result is strictly longer than
@@ -1051,7 +1052,7 @@ function buildFinalMetaTerminalDelta(
 		return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
 	}
 	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
-	const notices = extractDetailsNotices(result);
+	const notices = extractTerminalNotices(result);
 	return notices ? `\n${notices}\n` : undefined;
 }
 
@@ -1475,7 +1476,7 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 		// strictly not worse than silently dropping the notices everywhere.
 		// `checkAcpUpdateInvariants`'s rule 7 is gated on `terminalMetaCapable`
 		// for exactly this reason — it must never flag this fallback branch.
-		const notices = options.terminalMetaCapable ? undefined : extractDetailsNotices(value);
+		const notices = options.terminalMetaCapable ? undefined : extractTerminalNotices(value);
 		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
 		const withTerminal = hasTerminalContent(nonTextContent, terminalId)
 			? nonTextContent
@@ -1779,14 +1780,52 @@ function extractDetailsNotices(value: unknown): string | undefined {
 }
 
 /**
+ * `extractDetailsNotices` plus the same `details.meta` truncation/limit/
+ * diagnostics notice `extractOutputNoticeText` re-derives for edit results —
+ * generalized here to any tool, since `asEditDetails`' only real validation
+ * is `perFileResults`' shape, which a non-edit result simply lacks.
+ *
+ * Needed because the truncation/artifact-recovery notice
+ * (`wrapToolWithMetaNotice` → `formatOutputNotice`) is appended to the
+ * *text* content `enforceInlineByteCap`'s own producer-side notice-push
+ * (`bash.ts`) never reaches: `spilledArtifactId` there is populated only
+ * inside `enforceInlineByteCap`'s callback, which no-ops once `OutputSink`
+ * already spilled the body under the inline cap — the ordinary, common
+ * spill path. So for a call whose output already exceeded the sink's
+ * threshold, `details.notices` alone omits the one fact (byte count elided,
+ * `artifact://<id>` recovery pointer) a terminal-rendering client has no
+ * other channel to see, since the terminal path never surfaces tool text.
+ * A future `extractDetailsNotices`-only caller would silently repeat that
+ * loss (oh-my-pi/oh-my-pi#7078 review 4821242767, finding 2).
+ */
+function extractTerminalNotices(value: unknown): string | undefined {
+	const notices = extractDetailsNotices(value);
+	const metaNotice = extractOutputNoticeText(value)?.trim();
+	if (!metaNotice) return notices;
+	if (notices?.includes(metaNotice)) return notices;
+	// `bash.ts`'s own `[raw output: artifact://N]` notice and
+	// `formatOutputNotice`'s "Showing lines … Read artifact://N for full
+	// output" phrasing can both fire for the same spill (the rare case where
+	// the sink's own elision *and* the tool's final-defense byte cap both
+	// trip) — same artifact id, worded differently. Prefer whichever already
+	// made it into `notices` over restating the same recovery pointer twice.
+	const noticeArtifactIds = new Set([...(notices?.matchAll(/artifact:\/\/(\w+)/g) ?? [])].map(m => m[1]));
+	const metaArtifactIds = [...metaNotice.matchAll(/artifact:\/\/(\w+)/g)].map(m => m[1]);
+	if (metaArtifactIds.length > 0 && metaArtifactIds.every(id => noticeArtifactIds.has(id))) return notices;
+	return notices ? `${notices}\n\n${metaNotice}` : metaNotice;
+}
+
+/**
  * `_meta.terminal_output` for a real, client-owned live terminal (as opposed
  * to the display-only meta-terminal convention in `buildMetaTerminalDelta`).
  * Zed's `on_terminal_provider_event` (`agent_servers/acp.rs`) writes
  * `terminal_output` bytes straight into whatever terminal buffer already owns
  * that id — real or display-only — so this is a one-shot append of
- * `details.notices` plus any framework-level `directText` (e.g. "Permission
- * request cancelled") onto the *same* terminal id the live command already
- * used, landing inside the same card the process output rendered in (and its
+ * `extractTerminalNotices` (bash's own `details.notices` plus the
+ * truncation/artifact-recovery notice a spilled result's `details.meta`
+ * carries) plus any framework-level `directText` (e.g. "Permission request
+ * cancelled") onto the *same* terminal id the live command already used,
+ * landing inside the same card the process output rendered in (and its
  * "Copy as Markdown" export) instead of a sibling `content` item Zed's
  * `has_terminals` gate would silently drop. Only ever called once, from
  * `tool_execution_end` — there is no earlier point where bash's own notices
@@ -1806,7 +1845,7 @@ function buildLiveTerminalNoticeMeta(
 	if (!options.terminalMetaCapable) return undefined;
 	const terminalId = extractTerminalId(value);
 	if (!terminalId || !(options.isTerminalLive?.(terminalId) ?? true)) return undefined;
-	const notices = extractDetailsNotices(value);
+	const notices = extractTerminalNotices(value);
 	const directText = extractDirectText(value);
 	const combined = [notices, directText].filter((t): t is string => !!t).join("\n\n");
 	if (!combined) return undefined;
