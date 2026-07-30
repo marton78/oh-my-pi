@@ -49,15 +49,26 @@ run it in place with `bun run src/acp-probe.ts`). It has no default agent — po
 omp explicitly:
 
 ```bash
-ACP_PROBE_CMD="bun packages/coding-agent/src/cli.ts" \
-  acp-probe prompt "Run \`echo hi\` using the bash tool" --arg acp --terminal --log /tmp/frames.log
+acp-probe prompt "Run \`echo hi\` using the bash tool" \
+  --cmd packages/coding-agent/scripts/omp --terminal --log /tmp/frames.log
 grep -n "tool_call" /tmp/frames.log
 ```
 
-`--arg acp` supplies omp's own subcommand convention (`bun .../cli.ts acp`); other agents
+`--cmd` **must** be a single executable, not a shell command string — `acp-probe` spawns
+it directly (`Bun.spawn([cmd, ...args])`, no shell parsing), so
+`ACP_PROBE_CMD="bun packages/coding-agent/src/cli.ts"` fails with `ENOENT` (the whole
+string is looked up as one path). `scripts/omp` is the tracked dev launcher — point
+`--cmd`/`$ACP_PROBE_CMD` at it directly; the default (non-`--no-subcommand`) mode already
+appends `acp` as the child's first argument, so don't also pass `--arg acp`. Other agents
 take `--no-subcommand` instead (see acp-probe's README). Full subcommand/flag reference,
 and how to diff against `claude-agent-acp` as a rendering reference, live there — this doc
 only covers what's specific to omp.
+
+`--isolate` hides your real credentials (throwaway `XDG_*`/`PI_CODING_AGENT_DIR` state), so
+a `prompt` there usually fails with `RequestError: Internal error (code=-32603)` plus a
+`data: {"details":"No model selected. Use /login, ..."}` line — that's the probe correctly
+reporting a real auth failure, not a probe bug; use `--isolate` for handshake/session
+probing only, never for a `prompt` that needs to actually reach a model.
 
 Frame logs are the source of truth. Read the literal `content` array, `title`, and `kind`
 sent for the tool call you're working on before changing (or writing) any mapper code.
