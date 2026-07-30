@@ -60,6 +60,21 @@ interface AcpEventMapperOptions {
 	 * matter how capable the client is.
 	 */
 	realTerminalCapable?: boolean;
+	/**
+	 * The full cumulative meta-terminal output text already delivered to the
+	 * client for `toolCallId` (raw output only — never the eval source header
+	 * `buildTerminalMetaOutputData` prepends once up front), or `undefined` if
+	 * nothing has been sent yet. `tool_execution_update`/`tool_execution_end`
+	 * both carry the entire output-so-far (see `streamTailUpdates`/`eval.ts`'s
+	 * `pushUpdate`), but Zed's `terminal_output.data` is append-only bytes —
+	 * resending the same prefix on every progress tick and again at
+	 * completion duplicates it in the client's terminal. Backed by
+	 * session-scoped state in the caller so it survives across the
+	 * `tool_execution_update` → `tool_execution_end` sequence for one call.
+	 */
+	getMetaTerminalSent?: (toolCallId: string) => string | undefined;
+	/** Records the cumulative output text just delivered for `toolCallId` (see `getMetaTerminalSent`). */
+	setMetaTerminalSent?: (toolCallId: string, text: string) => void;
 }
 
 interface ContentArrayContainer {
@@ -281,16 +296,21 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			// cumulative-so-far text a live terminal would show (see
 			// `streamTailUpdates`/`eval.ts`'s `pushUpdate`), so mirror it into
 			// `_meta.terminal_output` instead of leaving the terminal blank until
-			// `tool_execution_end`.
+			// `tool_execution_end`. `buildMetaTerminalDelta` diffs against what was
+			// already sent so a growing cumulative snapshot becomes an append-only
+			// byte stream instead of duplicating everything shown so far.
 			if (wantsMetaTerminal(event.toolName, options)) {
 				const partialText = extractPartialTerminalText(event.partialResult);
 				if (partialText) {
-					update._meta = {
-						terminal_output: {
-							terminal_id: event.toolCallId,
-							data: buildTerminalMetaOutputData(event.toolName, event.args, partialText),
-						},
-					};
+					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, event.args, partialText, options);
+					if (delta) {
+						update._meta = {
+							terminal_output: {
+								terminal_id: event.toolCallId,
+								data: delta,
+							},
+						};
+					}
 				}
 			} else {
 				const codeFence = shouldCodeFenceToolOutput(event.toolName);
@@ -326,11 +346,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// `session/load` replay verbatim since it carries no client-owned
 				// resource reference.
 				update.content = [terminalToolCallContent(event.toolCallId)];
+				const finalOutput = extractReadableText(event.result) ?? "";
+				const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
 				update._meta = {
-					terminal_output: {
-						terminal_id: event.toolCallId,
-						data: buildTerminalMetaOutputData(event.toolName, args, extractReadableText(event.result) ?? ""),
-					},
+					...(delta !== undefined ? { terminal_output: { terminal_id: event.toolCallId, data: delta } } : {}),
 					terminal_exit: {
 						terminal_id: event.toolCallId,
 						exit_code: extractExitCode(event.result, event.isError),
@@ -752,6 +771,42 @@ function buildTerminalMetaOutputData(toolName: string, args: unknown, output: st
 	}
 	const code = buildEvalCodeText(args);
 	return code ? `${code}\n${"─".repeat(48)}\n${output}` : output;
+}
+
+/**
+ * The `_meta.terminal_output` payload to emit for `cumulativeOutput`, or
+ * `undefined` when there is nothing new to send. Diffs against the
+ * previously-delivered cumulative text (see `AcpEventMapperOptions.
+ * getMetaTerminalSent`) so a growing cumulative-so-far snapshot — the shape
+ * both `tool_execution_update` and `tool_execution_end` carry — becomes an
+ * append-only byte stream instead of resending everything already shown
+ * (Zed treats `terminal_output.data` as bytes to append, never a
+ * replacement). The one-time eval source header from
+ * `buildTerminalMetaOutputData` is included only on the very first send for
+ * this tool call, never repeated on later deltas.
+ */
+function buildMetaTerminalDelta(
+	toolCallId: string,
+	toolName: string,
+	args: unknown,
+	cumulativeOutput: string,
+	options: AcpEventMapperOptions,
+): string | undefined {
+	const prior = options.getMetaTerminalSent?.(toolCallId);
+	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
+	if (prior === undefined) {
+		return buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
+	}
+	if (cumulativeOutput === prior) {
+		return undefined;
+	}
+	if (cumulativeOutput.startsWith(prior)) {
+		return cumulativeOutput.slice(prior.length);
+	}
+	// Non-monotonic output relative to what was already sent — shouldn't
+	// happen per the cumulative-so-far contract, but resync with the full
+	// text rather than silently dropping it.
+	return buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
 }
 
 /**
