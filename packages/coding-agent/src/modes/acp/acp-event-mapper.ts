@@ -6,6 +6,7 @@ import type {
 	ToolCallLocation,
 	ToolKind,
 } from "@agentclientprotocol/sdk";
+import { logger } from "@oh-my-pi/pi-utils";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveToCwd } from "../../tools/path-utils";
@@ -774,9 +775,31 @@ function buildTerminalMetaOutputData(toolName: string, args: unknown, output: st
 }
 
 /**
+ * Bytes of `sent`'s tail trialled as an overlap candidate when a snapshot is
+ * not a plain extension of it. Bounded well above a single streamed chunk or
+ * tail-buffer roll increment — the only shapes this branch legitimately
+ * sees — since the trial cost is quadratic in this bound.
+ */
+const MAX_OVERLAP_TRIAL_BYTES = 4096;
+
+/**
+ * Length of the longest suffix of `sent` that is also a prefix of `next`,
+ * i.e. how many trailing bytes of `sent` reappear at the start of `next`.
+ * Tries the longest candidate first so a tail window that rolled forward
+ * splices where it actually continues rather than under-crediting overlap.
+ */
+function deliveredOverlap(sent: string, next: string): number {
+	const maxK = Math.min(sent.length, next.length, MAX_OVERLAP_TRIAL_BYTES);
+	for (let k = maxK; k > 0; k--) {
+		if (next.startsWith(sent.slice(sent.length - k))) return k;
+	}
+	return 0;
+}
+
+/**
  * The `_meta.terminal_output` payload to emit for `cumulativeOutput`, or
  * `undefined` when there is nothing new to send. Diffs against the
- * previously-delivered cumulative text (see `AcpEventMapperOptions.
+ * previously-delivered text (see `AcpEventMapperOptions.
  * getMetaTerminalSent`) so a growing cumulative-so-far snapshot — the shape
  * both `tool_execution_update` and `tool_execution_end` carry — becomes an
  * append-only byte stream instead of resending everything already shown
@@ -784,6 +807,10 @@ function buildTerminalMetaOutputData(toolName: string, args: unknown, output: st
  * replacement). The one-time eval source header from
  * `buildTerminalMetaOutputData` is included only on the very first send for
  * this tool call, never repeated on later deltas.
+ *
+ * The recorded state is exactly the bytes delivered so far — what the client's
+ * terminal holds — not the producer's latest snapshot, so a snapshot that
+ * regresses cannot make later deltas re-send bytes already on screen.
  */
 function buildMetaTerminalDelta(
 	toolCallId: string,
@@ -793,20 +820,45 @@ function buildMetaTerminalDelta(
 	options: AcpEventMapperOptions,
 ): string | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
-	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 	if (prior === undefined) {
-		return buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
+		const first = buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
+		options.setMetaTerminalSent?.(toolCallId, first);
+		return first;
 	}
 	if (cumulativeOutput === prior) {
 		return undefined;
 	}
 	if (cumulativeOutput.startsWith(prior)) {
+		options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 		return cumulativeOutput.slice(prior.length);
 	}
-	// Non-monotonic output relative to what was already sent — shouldn't
-	// happen per the cumulative-so-far contract, but resync with the full
-	// text rather than silently dropping it.
-	return buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
+	// The snapshot is not an extension of what the client already appended.
+	// `terminal_output.data` is append-only: delivered bytes can be neither
+	// replaced nor erased, so re-sending the whole snapshot duplicates visible
+	// output instead of resynchronizing. Two producers reach here legitimately —
+	// an authoritative snapshot that is shorter than the live-streamed tail it
+	// replaces, and a bounded tail buffer whose window rolled forward — so send
+	// only the genuinely undelivered remainder, and keep the delivered text as
+	// the watermark either way.
+	if (prior.startsWith(cumulativeOutput)) {
+		return undefined;
+	}
+	const overlap = deliveredOverlap(prior, cumulativeOutput);
+	if (overlap === 0) {
+		logger.warn("ACP terminal output snapshot diverged from delivered text; suppressing", {
+			toolCallId,
+			toolName,
+			deliveredBytes: prior.length,
+			snapshotBytes: cumulativeOutput.length,
+		});
+		return undefined;
+	}
+	const delta = cumulativeOutput.slice(overlap);
+	if (!delta) {
+		return undefined;
+	}
+	options.setMetaTerminalSent?.(toolCallId, prior + delta);
+	return delta;
 }
 
 /**

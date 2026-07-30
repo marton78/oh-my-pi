@@ -1269,6 +1269,89 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("splices only the undelivered remainder when a snapshot rolls its tail window forward without being a plain extension", () => {
+		// A bounded tail buffer's window can roll forward such that the new
+		// snapshot is neither a superset nor a subset of what was delivered
+		// (old leading bytes fell off the window). `terminal_output.data` is
+		// append-only, so the delta must be exactly the bytes past the overlap
+		// with what's already on screen — never the whole rolled window.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-roll",
+				toolName: "bash",
+				args: { command: "seq 1 100000" },
+				partialResult: { content: [{ type: "text", text: "line1\nline2\nline3" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const rolled = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-roll",
+				toolName: "bash",
+				args: { command: "seq 1 100000" },
+				// The window dropped "line1\n" off the front and gained "line4" at
+				// the back — an overlap of "line2\nline3", not a superset.
+				partialResult: { content: [{ type: "text", text: "line2\nline3\nline4" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const update = rolled[0]!.update as { _meta?: Record<string, unknown> };
+		expect(update._meta).toEqual({
+			terminal_output: { terminal_id: "tc-roll", data: "\nline4" },
+		});
+	});
+
+	it("suppresses a snapshot with no overlap against delivered text instead of resending it whole", () => {
+		// No genuine overlap exists (the producer emitted something wholly
+		// unrelated to what's already on screen). Appending it whole would
+		// duplicate/corrupt the append-only terminal; the correct behavior is
+		// to drop it rather than resend already-delivered bytes plus garbage.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-diverge",
+				toolName: "bash",
+				args: { command: "echo hi" },
+				partialResult: { content: [{ type: "text", text: "alpha beta gamma" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const diverged = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-diverge",
+				toolName: "bash",
+				args: { command: "echo hi" },
+				partialResult: { content: [{ type: "text", text: "zzz completely unrelated" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const update = diverged[0]!.update as { _meta?: Record<string, unknown> };
+		expect(update._meta).toBeUndefined();
+	});
+
 	it("emits no meta-terminal output on tool_execution_update when there is no partial output yet", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
