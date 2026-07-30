@@ -87,6 +87,7 @@ import {
 	normalizeReplayToolArguments,
 	wantsMetaTerminal,
 } from "./acp-event-mapper";
+import { assertAcpUpdateInvariants } from "./acp-update-invariants";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -491,6 +492,23 @@ export class AcpAgent implements Agent {
 		return this.#clientCapabilities?._meta?.terminal_output === true;
 	}
 
+	/**
+	 * Single emit chokepoint for every outbound `session/update` — checks the
+	 * finished frame against `docs/acp-development.md` rules 7 (a terminal
+	 * content item must be the update's only content item) and 9 (an
+	 * `_meta.terminal_*` key requires the negotiated capability) before
+	 * forwarding it unchanged. See `acp-update-invariants.ts` for why this
+	 * needs to run on the assembled frame rather than at each builder: a
+	 * violation is often only visible after content arrays from different
+	 * builders are merged. Returns the connection's promise directly (not
+	 * `async`) so callers that need the delivery promise itself (see the
+	 * `agent_message_chunk` streaming path) keep the same timing.
+	 */
+	#sendUpdate(notification: SessionNotification): Promise<void> {
+		assertAcpUpdateInvariants(notification, { terminalMetaCapable: this.#terminalMetaCapable() });
+		return this.#connection.sessionUpdate(notification);
+	}
+
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
 		this.#cancelCleanupTimeoutMs = Math.max(1, timeoutMs);
 	}
@@ -630,7 +648,7 @@ export class AcpAgent implements Agent {
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
 		this.#applyModeChange(record.session, params.modeId);
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
 		});
@@ -662,7 +680,7 @@ export class AcpAgent implements Agent {
 		// `current_mode_update` notification that `setSessionMode` emits so
 		// ACP clients tracking session-mode state see a consistent transition.
 		if (params.configId === MODE_CONFIG_ID) {
-			await this.#connection.sessionUpdate({
+			await this.#sendUpdate({
 				sessionId: record.session.sessionId,
 				update: this.#buildCurrentModeUpdate(record.session),
 			});
@@ -829,7 +847,7 @@ export class AcpAgent implements Agent {
 			refreshCommands: () => this.#emitAvailableCommandsUpdate(record),
 			reloadPlugins: () => this.#reloadPluginState(record),
 			notifyTitleChanged: async () => {
-				await this.#connection.sessionUpdate({
+				await this.#sendUpdate({
 					sessionId: record.session.sessionId,
 					update: {
 						sessionUpdate: "session_info_update",
@@ -1259,7 +1277,7 @@ export class AcpAgent implements Agent {
 			getMetaTerminalSent: toolCallId => record.metaTerminalSent.get(toolCallId),
 			setMetaTerminalSent: (toolCallId, text) => record.metaTerminalSent.set(toolCallId, text),
 		})) {
-			const delivery = this.#connection.sessionUpdate(notification);
+			const delivery = this.#sendUpdate(notification);
 			if (streamedAssistantError) {
 				// Resolves true only once the error chunk actually reached the
 				// client — a failed delivery keeps the agent_end fallback armed.
@@ -1327,7 +1345,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 		progress.textEmitted = true;
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId: record.session.sessionId,
 			update: {
 				sessionUpdate: "agent_message_chunk",
@@ -1365,7 +1383,7 @@ export class AcpAgent implements Agent {
 		if (!errorMessage || isSilentAbort(lastAssistant)) {
 			return;
 		}
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId: record.session.sessionId,
 			update: {
 				sessionUpdate: "agent_message_chunk",
@@ -1485,7 +1503,7 @@ export class AcpAgent implements Agent {
 		if (!text) {
 			return;
 		}
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId: record.session.sessionId,
 			update: {
 				sessionUpdate: "agent_message_chunk",
@@ -1544,7 +1562,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #pushConfigOptionUpdateForSession(session: AgentSession): Promise<void> {
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId: session.sessionId,
 			update: {
 				sessionUpdate: "config_option_update",
@@ -1743,7 +1761,7 @@ export class AcpAgent implements Agent {
 		session.setPlanProposalHandler?.(null);
 		session.setPlanModeState(undefined);
 		try {
-			await this.#connection.sessionUpdate({
+			await this.#sendUpdate({
 				sessionId: session.sessionId,
 				update: this.#buildCurrentModeUpdate(session),
 			});
@@ -1912,14 +1930,14 @@ export class AcpAgent implements Agent {
 		if (this.#sessions.get(sessionId) !== record) {
 			return;
 		}
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId,
 			update: {
 				sessionUpdate: "available_commands_update",
 				availableCommands: await this.#buildAvailableCommands(record.session),
 			},
 		});
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId,
 			update: {
 				sessionUpdate: "session_info_update",
@@ -1930,7 +1948,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #emitAvailableCommandsUpdate(record: ManagedSessionRecord): Promise<void> {
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId: record.session.sessionId,
 			update: {
 				sessionUpdate: "available_commands_update",
@@ -1963,7 +1981,7 @@ export class AcpAgent implements Agent {
 		const contextUsage = record.session.getContextUsage();
 		if (contextUsage) {
 			const usageStats = record.session.sessionManager.getUsageStatistics();
-			await this.#connection.sessionUpdate({
+			await this.#sendUpdate({
 				sessionId,
 				update: {
 					sessionUpdate: "usage_update",
@@ -1974,7 +1992,7 @@ export class AcpAgent implements Agent {
 			});
 		}
 
-		await this.#connection.sessionUpdate({
+		await this.#sendUpdate({
 			sessionId,
 			update: {
 				sessionUpdate: "session_info_update",
@@ -2101,7 +2119,7 @@ export class AcpAgent implements Agent {
 				announcedToolNames,
 				resolvedToolCallIds,
 			)) {
-				await this.#connection.sessionUpdate(notification);
+				await this.#sendUpdate(notification);
 			}
 		}
 		// `keepDanglingToolCalls` is only correct for a *live* stream, where the
@@ -2142,7 +2160,7 @@ export class AcpAgent implements Agent {
 						terminal_exit: { terminal_id: toolCallId, exit_code: null, signal: null },
 					}
 				: undefined;
-			await this.#connection.sessionUpdate({
+			await this.#sendUpdate({
 				sessionId: record.session.sessionId,
 				update: {
 					sessionUpdate: "tool_call_update",
