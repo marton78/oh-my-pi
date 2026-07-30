@@ -79,18 +79,20 @@ feature adoption alike. Read this before touching ACP code.
    diff.** `buildMetaTerminalDelta`/`buildFinalMetaTerminalDelta`
    (`acp-event-mapper.ts`) assume the text handed in is more of the same
    append-only byte stream. Several producers hand back a *display
-   re-render* instead: per-line truncation past `tools.maxColumn` (768 chars
-   by default — `details.meta.limits.columnTruncated`), or head/tail spill
-   elision past the artifact threshold (`details.meta.truncation`). Diffing
-   a re-render against the raw watermark via `deliveredOverlap` finds a
-   false zero overlap (a line truncated mid-stream rarely shares a
-   byte-for-byte suffix with the raw tail it replaced) and fires the
-   rollover-resync branch even though nothing was lost — a false
-   `discontinuity` notice plus a duplicate re-send of already-delivered
-   bytes. `buildFinalMetaTerminalDelta` checks `details.meta` for exactly
-   this before diffing anything, once a prefix has already streamed for the
-   call; any future producer-side reformatting of a final result needs the
-   same check, not a new diff heuristic.
+   re-render* instead: `eval.ts` trims leading/trailing whitespace off its
+   final output, per-line truncation past `tools.maxColumn` (768 chars by
+   default), or head/tail spill elision past the artifact threshold. There
+   is no enumerable list of every normalization a producer might apply, and
+   diffing a re-render against the raw watermark via `deliveredOverlap` can
+   find a false zero (or spuriously small, on self-similar bytes) overlap
+   and fire the rollover-resync branch even though nothing was lost — a
+   false `discontinuity` notice plus a duplicate re-send of already-delivered
+   bytes. `buildFinalMetaTerminalDelta` instead uses a structural invariant:
+   a display re-render can only shrink or preserve what already streamed,
+   never exceed it, so a final snapshot no longer than the watermark is
+   never diffed byte-for-byte — only genuinely new facts (`details.notices`)
+   ride through. Any future producer-side reformatting of a final result is
+   covered by this length check for free; it does not need a new marker.
 
 ## Running the probe against omp
 
