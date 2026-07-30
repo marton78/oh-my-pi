@@ -498,6 +498,78 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "foo.ts" }, { path: "bar.ts" }, { path: "skipped.ts" }]);
 	});
 
+	it("names successfully-edited files whose snapshot was pruned instead of dropping them", () => {
+		// Regression test: when a multi-file edit's aggregate snapshot budget
+		// runs out, a later successful entry can lose oldText/newText
+		// (snapshotsPruned: true) with no diff of its own. Without a fallback,
+		// the `diffContent.length > 0` branch renders only the entries that
+		// still have a diff and the pruned file vanishes from ACP content
+		// entirely, even though it was edited successfully.
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-pruned",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts\nUpdated b.ts" }],
+					details: {
+						perFileResults: [
+							{ path: "a.ts", diff: "...", oldText: "before-a\n", newText: "after-a\n" },
+							{ path: "b.ts", diff: "...", snapshotsPruned: true },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			content?: Array<{
+				type: string;
+				path?: string;
+				oldText?: string | null;
+				newText?: string;
+				content?: { type: string; text?: string };
+			}>;
+		};
+		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
+		expect(diffBlocks).toEqual([{ type: "diff", path: "a.ts", oldText: "before-a\n", newText: "after-a\n" }]);
+		const textBlocks = update.content?.filter(block => block.type === "content") ?? [];
+		expect(textBlocks).toHaveLength(1);
+		expect(textBlocks[0]?.content?.text).toBe("```\nAlso applied (diff omitted: file snapshot too large): b.ts\n```");
+	});
+
+	it("shows only diffs when every successful entry still has one, even with an unrelated pruned+errored entry", () => {
+		// snapshotsPruned entries that also failed (isError) are covered by the
+		// error-branch's own failure text, not this note — an entry can't be
+		// both a silent success and a reported failure.
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-pruned-error",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts" }],
+					details: {
+						perFileResults: [
+							{ path: "a.ts", diff: "...", oldText: "before-a\n", newText: "after-a\n" },
+							{ path: "b.ts", isError: true, snapshotsPruned: true, errorText: "boom" },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const update = updates[0]!.update as {
+			content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
+		};
+		expect(update.content).toEqual([{ type: "diff", path: "a.ts", oldText: "before-a\n", newText: "after-a\n" }]);
+	});
+
 	it("emits a diff ToolCallContent for single-file edit details", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{

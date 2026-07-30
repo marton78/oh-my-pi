@@ -373,7 +373,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// full joined echo.
 				let resultContent: ToolCallContent[];
 				if (diffContent.length > 0 && !event.isError) {
-					resultContent = diffContent;
+					const prunedText = extractPrunedEditPathsText(event.result);
+					resultContent = prunedText
+						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(prunedText) : prunedText)]
+						: diffContent;
 				} else if (diffContent.length > 0 && event.isError) {
 					const failureText = extractEditFailureText(event.result);
 					resultContent = failureText
@@ -1147,6 +1150,36 @@ function extractEditFailureText(result: unknown): string | undefined {
 		}
 	}
 	return lines.join("\n");
+}
+
+/**
+ * Names of successfully-edited files whose `oldText`/`newText` were dropped
+ * by {@link pruneOversizedEditSnapshots} once the multi-file aggregate budget
+ * (`MAX_EDIT_SNAPSHOT_TEXT_CHARS`) ran out — see `snapshot-details.ts`. Early
+ * entries keep their diff; a later entry in the same batch can lose its
+ * snapshot despite editing the file just as successfully. `buildDiffContent`
+ * then has nothing to render for it, so without this note the file
+ * disappears from the ACP content entirely even though the edit succeeded.
+ *
+ * Only entries with no diff of their own are named here — a pruned entry
+ * that still has room for its own snapshot never reaches this path.
+ */
+function extractPrunedEditPathsText(result: unknown): string | undefined {
+	if (typeof result !== "object" || result === null) return undefined;
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const perFile = (details as { perFileResults?: unknown }).perFileResults;
+	if (!Array.isArray(perFile)) return undefined;
+	const paths: string[] = [];
+	for (const entry of perFile) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const candidate = entry as { path?: unknown; isError?: unknown; snapshotsPruned?: unknown };
+		if (candidate.isError === true || candidate.snapshotsPruned !== true) continue;
+		if (buildDiffContent(entry)) continue;
+		if (typeof candidate.path === "string" && candidate.path.length > 0) paths.push(candidate.path);
+	}
+	if (paths.length === 0) return undefined;
+	return `Also applied (diff omitted: file snapshot too large): ${paths.join(", ")}`;
 }
 
 function buildDiffContent(entry: unknown): ToolCallContent | undefined {
