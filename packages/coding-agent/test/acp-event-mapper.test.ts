@@ -1260,6 +1260,43 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("preserves eval-cell images alongside the meta-terminal content block", () => {
+		// Regression test: the meta-terminal branch unconditionally replaced
+		// `content` with just the terminal reference, discarding any
+		// `display()`-produced image eval carries in `details.images`. The
+		// terminal can only render the text byte stream — binary content has
+		// nowhere else to go and must ride alongside it, not be dropped.
+		const imageData = "base64-image-data";
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-image",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [
+						{ type: "text", text: "(displayed 1 image; no text output)" },
+						{ type: "image", data: imageData, mimeType: "image/png" },
+					],
+					details: { images: [{ data: imageData, mimeType: "image/png" }] },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "plt.show()" }) },
+		);
+		const end = endUpdates[0]!.update as {
+			content?: Array<{
+				type: string;
+				terminalId?: string;
+				content?: { type: string; data?: string; mimeType?: string };
+			}>;
+		};
+		expect(end.content).toEqual([
+			{ type: "terminal", terminalId: "tc-eval-image" },
+			{ type: "content", content: { type: "image", data: imageData, mimeType: "image/png" } },
+		]);
+	});
+
 	it("streams cumulative output through the meta-terminal convention on tool_execution_update", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
