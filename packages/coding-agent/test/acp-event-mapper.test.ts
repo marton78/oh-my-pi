@@ -1269,6 +1269,66 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("streams past the 4000-char ACP_TEXT_LIMIT without stalling or truncating meta-terminal output", () => {
+		// Regression test: `extractTerminalStreamText` must not run the
+		// meta-terminal snapshot through `limitText`. A terminal is an
+		// append-only byte stream, not a text content block — clamping the
+		// snapshot to `ACP_TEXT_LIMIT` (4000 chars) makes every snapshot past
+		// that size byte-identical to the previous one once truncated, so
+		// `buildMetaTerminalDelta` sees no change and drops the rest of the
+		// stream, including the final `tool_execution_end` payload.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		const args = { language: "py", title: "hello", code: "print('hi')" };
+		const header = `print('hi')\n${"─".repeat(48)}\n`;
+		let raw = "";
+		let delivered = "";
+		for (let i = 0; i < 20; i++) {
+			raw += `line ${i} ${"y".repeat(500)}\n`;
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_update",
+					toolCallId: "tc-eval-large",
+					toolName: "eval",
+					args,
+					partialResult: { content: [{ type: "text", text: raw }], details: {} },
+				} as AgentSessionEvent,
+				"session-1",
+				options,
+			);
+			const update = updates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
+			const data = update._meta?.terminal_output?.data;
+			if (data) delivered += data;
+		}
+		expect(raw.length).toBeGreaterThan(4000);
+		const endUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-large",
+				toolName: "eval",
+				isError: false,
+				result: { content: [{ type: "text", text: raw }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
+		if (end._meta?.terminal_output?.data) delivered += end._meta.terminal_output.data;
+		// The header is sent exactly once, up front; every raw byte follows,
+		// with no truncation and no duplication. Only the very last trailing
+		// newline is missing — `extractTerminalStreamText`'s `.trim()`
+		// (applied to each cumulative snapshot before diffing) strips it, same
+		// as the old text-content path always did; not something this fix
+		// changes.
+		expect(delivered).toBe(header + raw.trimEnd());
+	});
+
 	it("splices only the undelivered remainder when a snapshot rolls its tail window forward without being a plain extension", () => {
 		// A bounded tail buffer's window can roll forward such that the new
 		// snapshot is neither a superset nor a subset of what was delivered
