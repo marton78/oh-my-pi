@@ -301,7 +301,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			// already sent so a growing cumulative snapshot becomes an append-only
 			// byte stream instead of duplicating everything shown so far.
 			if (wantsMetaTerminal(event.toolName, options)) {
-				const partialText = extractPartialTerminalText(event.partialResult);
+				const partialText = extractTerminalStreamText(event.partialResult);
 				if (partialText) {
 					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, event.args, partialText, options);
 					if (delta) {
@@ -347,7 +347,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// `session/load` replay verbatim since it carries no client-owned
 				// resource reference.
 				update.content = [terminalToolCallContent(event.toolCallId)];
-				const finalOutput = extractReadableText(event.result) ?? "";
+				const finalOutput = extractTerminalStreamText(event.result) ?? extractReadableText(event.result) ?? "";
 				const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, args, finalOutput, options);
 				update._meta = {
 					...(delta !== undefined ? { terminal_output: { terminal_id: event.toolCallId, data: delta } } : {}),
@@ -808,9 +808,12 @@ function deliveredOverlap(sent: string, next: string): number {
  * `buildTerminalMetaOutputData` is included only on the very first send for
  * this tool call, never repeated on later deltas.
  *
- * The recorded state is exactly the bytes delivered so far — what the client's
- * terminal holds — not the producer's latest snapshot, so a snapshot that
- * regresses cannot make later deltas re-send bytes already on screen.
+ * The recorded state is the raw producer bytes delivered so far, excluding the
+ * one-time eval source header — every later snapshot from the producer is raw
+ * (see `eval.ts`'s `pushUpdate`), so a header-prefixed watermark would never
+ * match the fast `startsWith` path below. It is never the producer's latest
+ * snapshot either, so a snapshot that regresses cannot make later deltas
+ * re-send bytes already on screen.
  */
 function buildMetaTerminalDelta(
 	toolCallId: string,
@@ -822,7 +825,7 @@ function buildMetaTerminalDelta(
 	const prior = options.getMetaTerminalSent?.(toolCallId);
 	if (prior === undefined) {
 		const first = buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
-		options.setMetaTerminalSent?.(toolCallId, first);
+		options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 		return first;
 	}
 	if (cumulativeOutput === prior) {
@@ -1457,20 +1460,35 @@ function extractDetailsNotices(value: unknown): string | undefined {
 }
 
 /**
- * The `content` array's text blocks, joined — nothing else. Unlike
- * `extractReadableText`, this never falls back to serializing the whole value
- * as JSON, so an empty/no-text partial result (e.g. before a command has
+ * The `content` array's text blocks joined verbatim — nothing else, and
+ * deliberately *not* run through `normalizeText`/`limitText`.
+ *
+ * Unlike `extractReadableText`, this never falls back to serializing the whole
+ * value as JSON, so an empty/no-text partial result (e.g. before a command has
  * printed anything) correctly yields `undefined` instead of a stringified
  * `{content:[],details:{}}` blob landing in a terminal.
+ *
+ * `ACP_TEXT_LIMIT` must not apply here. It bounds *text content blocks*, where
+ * a head truncation plus `…` is a readable degradation; a meta-terminal stream
+ * is append-only bytes, so clamping it silently freezes the terminal: every
+ * snapshot past the limit truncates to the same 4000 chars, so
+ * `buildMetaTerminalDelta` sees an unchanged snapshot and emits nothing —
+ * losing the rest of the stream including the final `tool_execution_end`
+ * payload. The producers already bound this text (`eval.ts` streams through a
+ * `TailBuffer(DEFAULT_MAX_BYTES * 2)`, bash truncates and says so in its own
+ * notices), `claude-agent-acp` sends `terminal_output` untruncated, and Zed
+ * truncates for display on its own (`original_content_len` vs `content.len()`
+ * in `thread_view.rs`).
  */
-function extractPartialTerminalText(value: unknown): string | undefined {
+function extractTerminalStreamText(value: unknown): string | undefined {
 	const blocks = getContentBlocks(value);
 	if (!blocks) return undefined;
 	const text = blocks
-		.map(block => extractStructuredText(block))
+		.map(block => extractStringProperty<TextLikeContent>(block, "text"))
 		.filter((chunk): chunk is string => typeof chunk === "string" && chunk.length > 0)
-		.join("\n");
-	return text.length > 0 ? normalizeText(text) : undefined;
+		.join("\n")
+		.trim();
+	return text.length > 0 ? text : undefined;
 }
 
 /**
