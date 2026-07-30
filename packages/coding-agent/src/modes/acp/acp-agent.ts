@@ -2139,8 +2139,14 @@ export class AcpAgent implements Agent {
 			// `content` text below never renders for one of these — the
 			// explanation must ride as `terminal_output` bytes on the same
 			// terminal id instead, sent before the `terminal_exit`.
+			// `args` is `undefined` here deliberately: this options object never sets
+			// `realTerminalCapable`, so `wantsMetaTerminal` always resolves via its
+			// `realTerminalCapable !== true` branch regardless of whether the
+			// original (now-dangling) call requested `pty` — the pty-vs-real-terminal
+			// distinction only matters when `realTerminalCapable` could otherwise be
+			// `true`.
 			const isMetaTerminal =
-				!!toolName && wantsMetaTerminal(toolName, { terminalMetaCapable: this.#terminalMetaCapable() });
+				!!toolName && wantsMetaTerminal(toolName, undefined, { terminalMetaCapable: this.#terminalMetaCapable() });
 			const metaTerminalMeta = isMetaTerminal
 				? {
 						terminal_output: { terminal_id: toolCallId, data: `\n${explanation}\n` },
