@@ -41,19 +41,32 @@ feature adoption alike. Read this before touching ACP code.
    stdout pollution, or capability gating that only misbehaves once a real `initialize`
    handshake and interleaved JSON-RPC ids are involved.
 7. **A gate/invariant violation is a class of bug, not an instance — and this one is now
-   enforced, not just documented.** `has_terminals` (`thread_view.rs`) hides *every*
-   sibling `content` item for *any* terminal-bearing tool call, live or meta.
-   `AcpAgent#sendUpdate` (`acp-agent.ts`) is the single chokepoint every outbound
-   `session/update` passes through; it runs `assertAcpUpdateInvariants`
-   (`acp-update-invariants.ts`), which fails (throws under `bun test`, logs otherwise)
-   any frame whose `content` carries a terminal item alongside a sibling. It checks the
-   *finished* frame, so it catches violations assembled from merged/dynamically-built
-   content — not just literal array shapes a static search could see — including in
-   code paths not yet written. If you add a new execute-kind tool or a new
-   `content`-merging branch, this is your safety net, not a substitute for still
-   getting the shape right: a violation here means the same content a user would have
-   silently lost is now a loud, immediate test failure instead of something a reviewer
-   has to notice by eye.
+   enforced, not just documented — but only for the client it actually applies to.**
+   `has_terminals` (`thread_view.rs`) hides *every* sibling `content` item for *any*
+   terminal-bearing tool call, live or meta, but that renderer quirk belongs to a Zed
+   client that negotiated `clientCapabilities._meta.terminal_output`
+   (`agent_servers/acp.rs` always sets it); the ACP schema itself imposes no such
+   exclusivity, so the mapper's best-effort sibling-content fallback for a client that
+   *hasn't* negotiated the extension is legitimate, not a bug. `AcpAgent#sendUpdate`
+   (`acp-agent.ts`) is the single chokepoint every outbound `session/update` passes
+   through; it runs `assertAcpUpdateInvariants` (`acp-update-invariants.ts`), which
+   fails (throws under `bun test`, logs otherwise) any frame whose `content` carries a
+   terminal item alongside a sibling **when `context.terminalMetaCapable` is true** —
+   gated, not unconditional, so it never flags the fallback branch it's meant to leave
+   alone. It checks the *finished* frame, so it catches violations assembled from
+   merged/dynamically-built content — not just literal array shapes a static search
+   could see — including in code paths not yet written. If you add a new
+   execute-kind tool or a new `content`-merging branch, this is your safety net, not a
+   substitute for still getting the shape right: a violation here means the same
+   content a user would have silently lost is now a loud, immediate test failure
+   instead of something a reviewer has to notice by eye. **The guard only earns that
+   claim if the tests you write actually call it** — mapper-level tests that call
+   `mapAgentSessionEventToAcpSessionUpdates` directly bypass `#sendUpdate` entirely, so
+   `packages/coding-agent/test/acp-event-mapper.test.ts`'s `mapUpdates()` wrapper runs
+   `checkAcpUpdateInvariants` on every frame the suite builds, not just the ones that
+   happen to flow through a real `AcpAgent` (oh-my-pi/oh-my-pi#7078 review 4821242767:
+   a violating `[terminal, content]` frame shipped, and two tests pinned it as correct,
+   because nothing in that 90-test suite ever ran the guard).
 
 8. **New incremental/derived stream state ships with its own boundary test in the
    commit that introduces it.** Watermarks, overlap/resync scans, delta encoders —
@@ -67,13 +80,16 @@ feature adoption alike. Read this before touching ACP code.
    (`acp-event-mapper.ts`) — there is no other write site.** It returns `undefined`
    unless `options.terminalMetaCapable`, so an ungated `_meta.terminal_*` emission
    isn't just discouraged, it's unwritable: build the object through it instead of a
-   literal `{ terminal_output: {...} }`. `assertAcpUpdateInvariants` (rule 7's guard)
-   additionally fails any frame carrying a `_meta.terminal_*` key when the client never
-   negotiated the capability, so a stray direct-literal write outside the builder — or
-   any future ad hoc `_meta.*` extension gated on a different capability — is still
-   caught at the emit chokepoint even if it bypasses `buildTerminalMeta` entirely. For a
-   brand-new `_meta.*` extension unrelated to the terminal convention, add its own gate
-   check to `checkAcpUpdateInvariants` rather than assuming rule 7's guard covers it.
+   literal `{ terminal_output: {...} }`. `assertAcpUpdateInvariants` additionally fails
+   any frame carrying a `_meta.terminal_*` key when the client never negotiated the
+   capability — unconditionally, unlike rule 7's terminal-sibling check, since an
+   unnegotiated `_meta` key is meaningless to every client regardless of whether it
+   also happens to be terminal-capable — so a stray direct-literal write outside the
+   builder, or any future ad hoc `_meta.*` extension gated on a different capability,
+   is still caught at the emit chokepoint even if it bypasses `buildTerminalMeta`
+   entirely. For a brand-new `_meta.*` extension unrelated to the terminal convention,
+   add its own gate check to `checkAcpUpdateInvariants` rather than assuming this one
+   covers it.
 10. **A tool's `tool_execution_end` result is not always a raw continuation of
    what `tool_execution_update` streamed — check before feeding it to a delta
    diff.** `buildMetaTerminalDelta`/`buildFinalMetaTerminalDelta`
