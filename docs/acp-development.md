@@ -109,6 +109,34 @@ feature adoption alike. Read this before touching ACP code.
    never diffed byte-for-byte — only genuinely new facts (`details.notices`)
    ride through. Any future producer-side reformatting of a final result is
    covered by this length check for free; it does not need a new marker.
+11. **A guard has to run where the frames it guards are built and tested,
+   or it enforces nothing.** `assertAcpUpdateInvariants` runs at
+   `AcpAgent#sendUpdate`, one layer above the mapper — but the bulk of ACP
+   frame coverage calls `mapAgentSessionEventToAcpSessionUpdates` directly
+   and never reaches that chokepoint. A `[terminal, content]` frame that
+   the guard rejects still shipped, with two mapper tests pinning it as
+   correct, because nothing in that suite ever ran the guard on the frames
+   it built (oh-my-pi/oh-my-pi#7078 review 4821242767). Adding an
+   enforcement mechanism is only half the fix: the tests that exercise the
+   code the mechanism protects have to call it too, or "235 tests enforce
+   this for free" is a claim, not a fact — verify it by deliberately
+   feeding the guard a known-violating frame from within the suite that's
+   supposed to catch it, not by reading the mechanism's own comment.
+12. **A fact that lives only in a tool's own text or `details.meta` is
+   invisible to the terminal-content path — re-derive it structurally, once,
+   at the point notices are collected.** The terminal path (`content:
+   [{type: "terminal", ...}]`, live or the display-only meta-terminal
+   convention) never surfaces a tool's ordinary text content or reads
+   `details.meta` directly; it only reads `details.notices`. `bash.ts`'s own
+   `[raw output: artifact://N]` push into `details.notices` is a
+   final-defense fallback that no-ops on the common path (`OutputSink`
+   already spilled under the inline cap), so the truncation/recovery
+   acknowledgement that *does* exist — in the tool's text and
+   `details.meta.truncation` — silently never reached a terminal-rendering
+   client. `extractTerminalNotices` (`acp-event-mapper.ts`) folds
+   `details.meta`'s notice (via the same `formatOutputNotice` the edit
+   branches already use) into every notice-delivery point instead of
+   trusting a producer's own `details.notices` push to be complete.
 
 ## Running the probe against omp
 
