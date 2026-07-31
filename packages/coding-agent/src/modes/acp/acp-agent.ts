@@ -82,6 +82,7 @@ import {
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
+	buildMetaTerminalOutput,
 	buildTerminalMeta,
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -2170,7 +2171,20 @@ export class AcpAgent implements Agent {
 				? buildTerminalMeta(
 						{ terminalMetaCapable: this.#terminalMetaCapable() },
 						{
-							output: { terminal_id: toolCallId, data: `\n${explanation}\n` },
+							// `replayedToolCallArgs` (not `args` above) on purpose: an
+							// interrupted `eval` call's source has nowhere else to render
+							// once this cleanup fires (see `buildMetaTerminalOutput`) — the
+							// tool call's own args from the persisted transcript are the
+							// only place it survives. `getMetaTerminalSent` is empty for a
+							// dangling call (it never reached a live `tool_execution_update`/
+							// `_end` during replay), so the header is included exactly once.
+							output: buildMetaTerminalOutput(
+								toolCallId,
+								toolName ?? "",
+								replayedToolCallArgs.get(toolCallId),
+								`\n${explanation}\n`,
+								{ getMetaTerminalSent: id => record.metaTerminalSent.get(id) },
+							),
 							exit: { terminal_id: toolCallId, exit_code: null, signal: null },
 						},
 					)
