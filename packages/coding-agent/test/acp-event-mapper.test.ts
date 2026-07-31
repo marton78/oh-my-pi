@@ -30,6 +30,7 @@ import {
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { formatOutputNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { frameTexts, producerFacts } from "./helpers/acp-producer-facts";
 import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
 
 /**
@@ -58,6 +59,22 @@ beforeEach(() => {
 	evalSourceAuditor = new EvalSourceDeliveryAuditor();
 });
 
+/**
+ * `checkAcpUpdateInvariants`/`EvalSourceDeliveryAuditor` check frame *shape*
+ * and the eval *source* respectively; neither has any notion of "did every
+ * fact the producer recorded structurally survive onto this frame" — the
+ * general form of the artifact-pointer/notice losses (rule 12/15). Running
+ * `producerFacts`/`frameTexts` here, on every `tool_execution_end` this ~90
+ * test suite builds, is what the matrix in `acp-producer-wire.test.ts`
+ * cannot do by itself: that matrix's own fixtures are real producer results,
+ * but no row produces both an image and a details-only fact, so the axis
+ * this check exists for had zero coverage there (oh-my-pi/oh-my-pi#7078
+ * review 4829715458). This suite's fixtures are hand-fabricated, so they
+ * *can* combine any shape — the fact-delivery check is only meaningful when
+ * a fixture actually declares a fact, which is why the new regression tests
+ * for this finding set `details.notice`/`errorMessage` explicitly instead of
+ * relying on this generic check to invent one.
+ */
 function mapUpdates(
 	event: AgentSessionEvent,
 	sessionId: string,
@@ -72,6 +89,17 @@ function mapUpdates(
 	for (const update of updates) {
 		expect(checkAcpUpdateInvariants(update, context)).toEqual([]);
 		expect(evalSourceAuditor.observe(update)).toEqual([]);
+	}
+	if (event.type === "tool_execution_end") {
+		const facts = producerFacts(event.result);
+		if (facts.length > 0) {
+			const texts = updates
+				.flatMap(({ update }) => frameTexts(update as unknown as Record<string, unknown>))
+				.join("\n");
+			for (const fact of facts) {
+				expect(texts).toContain(fact);
+			}
+		}
 	}
 	return updates;
 }
