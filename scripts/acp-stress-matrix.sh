@@ -38,10 +38,20 @@ n=0
 run_probe() {
 	# run_probe <label> <assertion> <probe-args...>
 	# assertion: "exit=<N>" compares the subcommand's own exit code (kill-mid-tool);
-	#            "min=<N>" compares parsed delivered= against a computed floor
-	#            (stress-output — its own exit code assumes "delivered < requested"
-	#            is always a bug, which is wrong once requested exceeds the tool's
-	#            own producer-side cap; see the size loop below).
+	#            "min=<N>" requires the probe's own exit code to be 0 *and* the
+	#            parsed delivered= to clear a computed floor. `stress-output`'s
+	#            exit code is already the authoritative verdict for both the
+	#            byte-shortfall axis (it tells an admitted producer-side cap —
+	#            bash's 50 KB / eval's 100 KB tail buffer — apart from silent
+	#            suppression, exiting 0 with a warn log for the former) and the
+	#            append-only axis (any duplicate terminal delivery fails the run
+	#            unconditionally, `acp-probe.ts`'s post-switch check). Reading
+	#            only `delivered=` and ignoring `$code` (fixed after
+	#            oh-my-pi/oh-my-pi#7078 review r3693558608) let a duplicate-resend
+	#            regression report PASS here, since a re-sent body inflates
+	#            `delivered` rather than shrinking it — the floor is now a
+	#            belt-and-suspenders sanity check on top of the exit code, never
+	#            a substitute for it.
 	local label="$1" assertion="$2"
 	shift 2
 	n=$((n + 1))
@@ -62,8 +72,12 @@ run_probe() {
 		;;
 	min=*)
 		local floor="${assertion#min=}"
-		detail="delivered=${delivered:-0} floor=$floor"
-		if [ -z "$delivered" ] || [ "$delivered" -lt "$floor" ]; then status="REGRESSION"; fi
+		detail="exit=$code delivered=${delivered:-0} floor=$floor"
+		if [ "$code" != 0 ]; then
+			status="REGRESSION"
+		elif [ -z "$delivered" ] || [ "$delivered" -lt "$floor" ]; then
+			status="REGRESSION"
+		fi
 		;;
 	esac
 	if [ "$status" = OK ]; then pass=$((pass + 1)); else fail=$((fail + 1)); fi
