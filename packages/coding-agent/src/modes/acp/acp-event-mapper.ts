@@ -334,10 +334,15 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
+			// `event.isError` is the result-level flag, which `eval` never sets:
+			// its builder records a nonzero-exit cell only in `details` (see
+			// `isFailedToolResult`), so read the failure structurally instead of
+			// reporting a failed call as completed with a synthetic exit 0.
+			const failed = isFailedToolResult(event.result, event.isError);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
-				status: event.isError ? "failed" : "completed",
+				status: failed ? "failed" : "completed",
 				rawOutput: event.result,
 			};
 			if (wantsMetaTerminal(event.toolName, args, options)) {
@@ -372,7 +377,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					update._meta = buildTerminalMeta(options, {
 						exit: {
 							terminal_id: event.toolCallId,
-							exit_code: extractExitCode(event.result, event.isError),
+							exit_code: extractExitCode(event.result, failed),
 							signal: null,
 						},
 					});
@@ -397,7 +402,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 						...(delta !== undefined ? { output: delta } : {}),
 						exit: {
 							terminal_id: event.toolCallId,
-							exit_code: extractExitCode(event.result, event.isError),
+							exit_code: extractExitCode(event.result, failed),
 							signal: null,
 						},
 					});
@@ -428,14 +433,14 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// general content array in favor of a diff — re-derive and re-append it
 				// from the structured `meta` field instead of the (now-discarded) text.
 				let resultContent: ToolCallContent[];
-				if (diffContent.length > 0 && !event.isError) {
+				if (diffContent.length > 0 && !failed) {
 					const prunedText = extractPrunedEditPathsText(event.result);
 					const noticeText = extractOutputNoticeText(event.result);
 					const combinedText = [prunedText, noticeText].filter((t): t is string => !!t).join("\n\n");
 					resultContent = combinedText
 						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(combinedText) : combinedText)]
 						: diffContent;
-				} else if (diffContent.length > 0 && event.isError) {
+				} else if (diffContent.length > 0 && failed) {
 					const prunedText = extractPrunedEditPathsText(event.result);
 					const failureText = extractEditFailureText(event.result);
 					const combinedText = failureText
@@ -1229,21 +1234,66 @@ function isPtyRequested(args: unknown): boolean {
 }
 
 /**
+ * Whether this tool call failed, from the result itself rather than only the
+ * result-level `isError` flag the agent loop derived (`cursor.ts`'s
+ * `isError ||= result.isError === true`).
+ *
+ * `eval` is the producer that makes the distinction load-bearing: a cell that
+ * exits nonzero is recorded in `details.isError` plus
+ * `details.cells[].exitCode`, and its result builder never calls `.error()`
+ * (see `eval.ts`'s nonzero-exit and cancelled branches), so the event's
+ * `isError` is false for a call whose own output text says `Command exited
+ * with code 1`. Reporting that as `status: "completed"` with a synthesized
+ * `exit_code: 0` makes both the card and its terminal claim success. The TUI
+ * renderers already fall back to `details.isError` for exactly this reason
+ * (`edit/renderer.ts`, `mcp/render.ts`) — same fallback here, not a second
+ * convention. Every other producer sets the result-level flag too (or
+ * both, as `mcp/tool-bridge.ts` does), so this only ever adds failures the
+ * result already admits to.
+ */
+function isFailedToolResult(value: unknown, isError: boolean | undefined): boolean {
+	if (isError === true) return true;
+	const details = toolResultDetails(value);
+	return details !== undefined && "isError" in details && details.isError === true;
+}
+
+/** The `details` object of a tool result, when it has one. */
+function toolResultDetails(value: unknown): object | undefined {
+	if (typeof value !== "object" || value === null || !("details" in value)) return undefined;
+	const details = value.details;
+	return typeof details === "object" && details !== null ? details : undefined;
+}
+
+/**
  * `bash`/`shell`/`exec` only set `details.exitCode` on a nonzero exit (see
  * `#buildCompletedResult`) — a successful run's process really did exit 0,
- * it just isn't spelled out in the details object. Report that explicit 0
- * rather than leaving the terminal's exit status blank, but never guess a
- * number for an unattributed failure (wrong signal is worse than none).
+ * it just isn't spelled out in the details object. `eval` never sets a
+ * top-level `exitCode` at all: each cell carries its own, and execution stops
+ * at the first one that fails, so the failing cell's code is the call's exit
+ * status. Report an explicit 0 for a successful run rather than leaving the
+ * terminal's exit status blank, but never guess a number for an unattributed
+ * failure (a wrong code is worse than none) — an aborted eval, for instance,
+ * has no exit code anywhere.
  */
 function extractExitCode(value: unknown, isError: boolean | undefined): number | undefined {
-	if (typeof value === "object" && value !== null) {
-		const details = (value as DetailsContainer).details;
-		if (typeof details === "object" && details !== null) {
-			const exitCode = (details as { exitCode?: unknown }).exitCode;
-			if (typeof exitCode === "number") return exitCode;
-		}
+	const details = toolResultDetails(value);
+	if (details !== undefined) {
+		if ("exitCode" in details && typeof details.exitCode === "number") return details.exitCode;
+		const failedCellExitCode = extractFailedCellExitCode(details);
+		if (failedCellExitCode !== undefined) return failedCellExitCode;
 	}
 	return isError ? undefined : 0;
+}
+
+/** The exit code of the first `eval` cell that failed (see `extractExitCode`). */
+function extractFailedCellExitCode(details: object): number | undefined {
+	if (!("cells" in details) || !Array.isArray(details.cells)) return undefined;
+	for (const cell of details.cells) {
+		if (typeof cell !== "object" || cell === null || !("exitCode" in cell)) continue;
+		const exitCode = cell.exitCode;
+		if (typeof exitCode === "number" && exitCode !== 0) return exitCode;
+	}
+	return undefined;
 }
 
 /**
