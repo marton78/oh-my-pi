@@ -67,7 +67,7 @@ export interface AcpEventMapperOptions {
 	/**
 	 * The full cumulative meta-terminal output text already delivered to the
 	 * client for `toolCallId` (raw output only — never the eval source header
-	 * `buildTerminalMetaOutputData` prepends once up front), or `undefined` if
+	 * `buildMetaTerminalOutput` prepends once up front), or `undefined` if
 	 * nothing has been sent yet. `tool_execution_update`/`tool_execution_end`
 	 * both carry the entire output-so-far (see `streamTailUpdates`/`eval.ts`'s
 	 * `pushUpdate`), but Zed's `terminal_output.data` is append-only bytes —
@@ -312,9 +312,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				if (partialText) {
 					const delta = buildMetaTerminalDelta(event.toolCallId, event.toolName, event.args, partialText, options);
 					if (delta) {
-						update._meta = buildTerminalMeta(options, {
-							output: { terminal_id: event.toolCallId, data: delta },
-						});
+						update._meta = buildTerminalMeta(options, { output: delta });
 					}
 				}
 			} else {
@@ -392,7 +390,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 						options,
 					);
 					update._meta = buildTerminalMeta(options, {
-						...(delta !== undefined ? { output: { terminal_id: event.toolCallId, data: delta } } : {}),
+						...(delta !== undefined ? { output: delta } : {}),
 						exit: {
 							terminal_id: event.toolCallId,
 							exit_code: extractExitCode(event.result, event.isError),
@@ -461,7 +459,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// (`agent_servers/acp.rs`) writes `_meta.terminal_output` straight
 				// into whatever terminal buffer already owns that id, so this
 				// genuinely renders inside the live card instead of vanishing.
-				const liveTerminalNoticeMeta = buildLiveTerminalNoticeMeta(event.result, options);
+				const liveTerminalNoticeMeta = buildLiveTerminalNoticeMeta(event.result, event.toolName, args, options);
 				if (liveTerminalNoticeMeta) {
 					update._meta = liveTerminalNoticeMeta;
 				}
@@ -686,7 +684,7 @@ export function buildTerminalMeta(
 	options: Pick<AcpEventMapperOptions, "terminalMetaCapable">,
 	parts: {
 		info?: { terminal_id: string; cwd?: string };
-		output?: { terminal_id: string; data: string };
+		output?: MetaTerminalOutput;
 		exit?: { terminal_id: string; exit_code: number | null | undefined; signal: null };
 	},
 ): Record<string, unknown> | undefined {
@@ -818,7 +816,7 @@ function buildEvalStartText(args: unknown): string | undefined {
  * they're concatenated below — so each cell's own `[lang] title` line is
  * kept here to preserve that attribution.
  */
-function buildEvalCodeText(args: unknown): string | undefined {
+export function buildEvalCodeText(args: unknown): string | undefined {
 	if (typeof args !== "object" || args === null || Array.isArray(args)) {
 		return undefined;
 	}
@@ -853,25 +851,63 @@ function buildEvalCodeText(args: unknown): string | undefined {
 	return limitText(codeBlocks.join("\n\n"));
 }
 
+declare const metaTerminalOutputBrand: unique symbol;
+
 /**
- * The final `terminal_output` payload for a meta-terminal tool call.
- * Zed's `render_any_tool_call` routes any tool call carrying a `terminal`
- * content item exclusively through its terminal renderer (see
- * `has_terminals` in `thread_view.rs`) — every other `content` item on the
- * same tool call is silently ignored, never shown "hidden until expanded"
- * as `buildEvalStartText`'s doc comment once assumed. `bash`/`shell`/`exec`
- * need no workaround: their title *is* the full command already. But
- * `eval`'s title is deliberately a short `[lang] cellTitle` label (see
- * `buildEvalTitle`), so its source has nowhere else to render — the only
- * remaining place is inside the terminal's own text stream, echoed ahead of
- * the real output like a shell echoing the command it's about to run.
+ * A `_meta.terminal_output` payload. Nominally branded, and the brand symbol
+ * is module-private, so the only way to obtain one is `buildMetaTerminalOutput`
+ * below — an inline `{terminal_id, data}` literal at a call site is a *type
+ * error*, not merely discouraged.
+ *
+ * That matters because the payload body is not a dumb string: for `eval` it
+ * carries a one-time source header that has nowhere else to render (see
+ * `buildMetaTerminalOutput`). Both known losses of that header came from a
+ * call site hand-rolling the literal — the `session/load` dangling-call
+ * cleanup in `acp-agent.ts` (oh-my-pi/oh-my-pi#7078 review 4823843361) and,
+ * in a different channel, the image fallback below. `buildTerminalMeta`
+ * (rule 9) already made an *ungated* `_meta.terminal_*` write unexpressible;
+ * this makes an *uncomposed* one unexpressible too.
  */
-function buildTerminalMetaOutputData(toolName: string, args: unknown, output: string): string {
-	if (toolName !== "eval") {
-		return output;
-	}
-	const code = buildEvalCodeText(args);
-	return code ? `${code}\n${"─".repeat(48)}\n${output}` : output;
+export interface MetaTerminalOutput {
+	readonly terminal_id: string;
+	readonly data: string;
+	readonly [metaTerminalOutputBrand]: true;
+}
+
+/**
+ * The sole constructor for a `_meta.terminal_output` payload.
+ *
+ * Zed's `render_any_tool_call` (`thread_view.rs`) routes any tool call
+ * carrying a `terminal` content item exclusively through its terminal
+ * renderer (`has_terminals`) — every other `content` item on the same tool
+ * call is silently ignored. `bash`/`shell`/`exec` need no workaround: their
+ * title *is* the full command already. But `eval`'s title is deliberately a
+ * short `[lang] cellTitle` label (see `buildEvalTitle`), so its source has
+ * nowhere else to render — the only remaining place is inside the terminal's
+ * own text stream, echoed ahead of the real output like a shell echoing the
+ * command it's about to run.
+ *
+ * The header rides on the *first* payload for a terminal id and never again:
+ * `getMetaTerminalSent` is `undefined` only before anything has been
+ * delivered for that call, which is exactly the append-only stream's
+ * beginning. Callers therefore need no `isFirstSend` flag to get right —
+ * every one of them just hands over its bytes.
+ */
+export function buildMetaTerminalOutput(
+	terminalId: string,
+	toolName: string,
+	args: unknown,
+	data: string,
+	options: Pick<AcpEventMapperOptions, "getMetaTerminalSent">,
+): MetaTerminalOutput {
+	const code =
+		toolName === "eval" && options.getMetaTerminalSent?.(terminalId) === undefined
+			? buildEvalCodeText(args)
+			: undefined;
+	return {
+		terminal_id: terminalId,
+		data: code ? `${code}\n${"─".repeat(48)}\n${data}` : data,
+	} as MetaTerminalOutput;
 }
 
 /**
@@ -928,7 +964,7 @@ export function deliveredOverlap(sent: string, next: string): number {
  * append-only byte stream instead of resending everything already shown
  * (Zed treats `terminal_output.data` as bytes to append, never a
  * replacement). The one-time eval source header from
- * `buildTerminalMetaOutputData` is included only on the very first send for
+ * `buildMetaTerminalOutput` is included only on the very first send for
  * this tool call, never repeated on later deltas.
  *
  * The recorded state is the raw producer bytes delivered so far, excluding the
@@ -944,10 +980,10 @@ function buildMetaTerminalDelta(
 	args: unknown,
 	cumulativeOutput: string,
 	options: AcpEventMapperOptions,
-): string | undefined {
+): MetaTerminalOutput | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
 	if (prior === undefined) {
-		const first = buildTerminalMetaOutputData(toolName, args, cumulativeOutput);
+		const first = buildMetaTerminalOutput(toolCallId, toolName, args, cumulativeOutput, options);
 		options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 		return first;
 	}
@@ -956,7 +992,7 @@ function buildMetaTerminalDelta(
 	}
 	if (cumulativeOutput.startsWith(prior)) {
 		options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
-		return cumulativeOutput.slice(prior.length);
+		return buildMetaTerminalOutput(toolCallId, toolName, args, cumulativeOutput.slice(prior.length), options);
 	}
 	// The snapshot is not an extension of what the client already appended.
 	// `terminal_output.data` is append-only: delivered bytes can be neither
@@ -990,7 +1026,13 @@ function buildMetaTerminalDelta(
 			snapshotBytes: cumulativeOutput.length,
 		});
 		options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
-		return `\n[terminal output discontinuity: earlier bytes were dropped]\n${cumulativeOutput}`;
+		return buildMetaTerminalOutput(
+			toolCallId,
+			toolName,
+			args,
+			`\n[terminal output discontinuity: earlier bytes were dropped]\n${cumulativeOutput}`,
+			options,
+		);
 	}
 	const delta = cumulativeOutput.slice(overlap);
 	if (!delta) {
@@ -1011,7 +1053,7 @@ function buildMetaTerminalDelta(
 		toolCallId,
 		watermark.length > MAX_WATERMARK_BYTES ? watermark.slice(watermark.length - MAX_WATERMARK_BYTES) : watermark,
 	);
-	return delta;
+	return buildMetaTerminalOutput(toolCallId, toolName, args, delta, options);
 }
 
 /**
@@ -1064,7 +1106,7 @@ function buildFinalMetaTerminalDelta(
 	cumulativeOutput: string,
 	result: unknown,
 	options: AcpEventMapperOptions,
-): string | undefined {
+): MetaTerminalOutput | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
 	if (prior === undefined) {
 		return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
@@ -1079,7 +1121,7 @@ function buildFinalMetaTerminalDelta(
 	}
 	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 	const notices = extractTerminalNotices(result);
-	return notices ? `\n${notices}\n` : undefined;
+	return notices ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${notices}\n`, options) : undefined;
 }
 
 /**
@@ -1886,6 +1928,8 @@ function extractTerminalNotices(value: unknown): string | undefined {
  */
 function buildLiveTerminalNoticeMeta(
 	value: unknown,
+	toolName: string,
+	args: unknown,
 	options: AcpEventMapperOptions,
 ): Record<string, unknown> | undefined {
 	if (!options.terminalMetaCapable) return undefined;
@@ -1895,7 +1939,9 @@ function buildLiveTerminalNoticeMeta(
 	const directText = extractDirectText(value);
 	const combined = [notices, directText].filter((t): t is string => !!t).join("\n\n");
 	if (!combined) return undefined;
-	return buildTerminalMeta(options, { output: { terminal_id: terminalId, data: `\n${combined}\n` } });
+	return buildTerminalMeta(options, {
+		output: buildMetaTerminalOutput(terminalId, toolName, args, `\n${combined}\n`, options),
+	});
 }
 
 /**

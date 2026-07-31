@@ -26,6 +26,7 @@ import {
 	AcpAgent,
 	createAcpExtensionUiContext,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
+import { EvalSourceDeliveryAuditor } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-update-invariants";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type {
 	AgentSession,
@@ -1558,6 +1559,14 @@ describe("ACP agent", () => {
 		// block explaining the interruption never renders — it must ride as
 		// `terminal_output` bytes on the same terminal id instead, and the
 		// sibling `content` block must not be sent at all for this case.
+		//
+		// Second follow-up (oh-my-pi/oh-my-pi#7078 review 4823843361): the
+		// original fixture used `input: { cells: [] }`, an empty eval with no
+		// source — `buildEvalCodeText` degenerates to `undefined` for it, so
+		// the eval-source-loss bug this test exists to catch (the cleanup wrote
+		// only the interruption text, never the interrupted code) was invisible
+		// no matter which shape shipped. A real single-cell `code` argument is
+		// required for this assertion to be capable of failing.
 		const harness = await createHarness();
 		await harness.agent.initialize({
 			protocolVersion: 1,
@@ -1569,7 +1578,12 @@ describe("ACP agent", () => {
 		stored.sessionManager.appendMessage({
 			role: "assistant",
 			content: [
-				{ type: "tool_use", id: "toolu_dangling_meta", name: "eval", input: { cells: [] } },
+				{
+					type: "tool_use",
+					id: "toolu_dangling_meta",
+					name: "eval",
+					input: { language: "py", code: "print('interrupted')" },
+				},
 			] as unknown as Array<{ type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }>,
 			api: "openai-responses",
 			provider: "openai",
@@ -1617,9 +1631,20 @@ describe("ACP agent", () => {
 		});
 		expect(failedUpdate._meta?.terminal_output).toEqual({
 			terminal_id: "toolu_dangling_meta",
-			data: "\nInterrupted: no result recorded before the process ended.\n",
+			data: `print('interrupted')\n${"─".repeat(48)}\n\nInterrupted: no result recorded before the process ended.\n`,
 		});
 		expect(failedUpdate.content).toBeUndefined();
+		// Generic guard (rule 13): whatever channel the final frame actually
+		// renders through, the interrupted eval's own source must appear on it
+		// somewhere across the whole replay sequence — not just in this one
+		// hand-picked `terminal_output` assertion above. Feeding the full
+		// `announcedToolCallIds` sequence through the same auditor the mapper
+		// suite uses exercises the actual `#replaySessionHistory` code path
+		// this bug lived in, not a mapper-only reproduction of it.
+		const auditor = new EvalSourceDeliveryAuditor();
+		auditor.expect("toolu_dangling_meta", "eval", { language: "py", code: "print('interrupted')" });
+		const violations = toolUpdates.flatMap(update => auditor.observe({ sessionId: stored.sessionId, update }));
+		expect(violations).toEqual([]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
