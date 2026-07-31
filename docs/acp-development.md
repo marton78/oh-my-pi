@@ -264,6 +264,45 @@ feature adoption alike. Read this before touching ACP code.
     deliveries. `acp-probe` enforces the same append-only property on every run
     against the real wire (`duplicateTerminalDeliveries`/
     `discontinuityNotices` in its summary, exit 1 on a repeat).
+17. **A check placed only where its fixtures cannot populate the field it
+    reads enforces nothing — and every declared fact axis needs its own
+    non-vacuity proof, not just the mechanism's existence.** Rule 15's
+    matrix check ("no fact the producer recorded structurally is missing
+    from the frame") is the right mechanism, but it lived only in
+    `acp-producer-wire.test.ts`, whose rows are real tool results: no row's
+    real producer ever set `details.notice` (`ResolvedBackend.notice` has no
+    writer anywhere in `src/`), so that declared axis was read on every row
+    and never once failed. The mapper's eval image fallback (the
+    `wantsMetaTerminal` branch that drops the terminal item for an image)
+    composed `content` by hand instead of going through the shared notice/
+    `directText` collection point every other terminal-rendering exit path
+    used, dropped `details.notice`/`errorMessage`, and shipped anyway
+    (oh-my-pi/oh-my-pi#7078 review 4829715458). `extractTerminalDeliverableFacts`
+    (`acp-event-mapper.ts`) is now the one place `extractTerminalNotices` and
+    `extractDirectText` are joined; `buildLiveTerminalNoticeMeta`,
+    `buildFinalMetaTerminalDelta` (which was itself missing `directText` on
+    the display-only meta path, a second unreported instance of the same
+    class), and the image fallback all compose through it. The check itself
+    now also runs in `acp-event-mapper.test.ts`'s `mapUpdates()` wrapper (via
+    `test/helpers/acp-producer-facts.ts`, shared with the matrix), since that
+    suite's hand-fabricated fixtures *can* declare any fact combination a
+    real producer's type doesn't allow — confirmed necessary: `eval`'s image
+    and `details.notice` cannot occur together through any typed production
+    entrypoint (`EvalProxyExecutor`'s declared return type is text-only content,
+    and `tsgo` rejects the combined shape outright), so only the mapper
+    suite's synthetic fixtures can exercise that exact combination, while the
+    matrix covers each axis separately with a real producer. A **vacuity
+    guard** — asserting each declared fact axis is actually non-empty on at
+    least one row's real result — is now part of the matrix itself, proven
+    non-vacuous the same way every other guard in this doc is: blank the one
+    row that populates an axis and confirm the guard fails before restoring
+    it. When a fact axis has no real single-tool producer at all within a
+    suite's scope (the top-level `errorMessage` this PR chased is
+    synthesized by the agent loop's permission-cancellation catch, a layer
+    above any `AgentTool.execute()` result — see `docs/acp-development.md`
+    rule 15's matrix scope), that is itself a fact worth recording in the
+    test, not silently working around by fabricating a producer that
+    doesn't exist.
 
 ## Running the probe against omp
 
