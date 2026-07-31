@@ -311,6 +311,81 @@ feature adoption alike. Read this before touching ACP code.
     test, not silently working around by fabricating a producer that
     doesn't exist.
 
+18. **Every check in this doc catches extra or contradictory bytes — until this
+   rule, none caught missing ones.** `checkAcpUpdateInvariants` (rule 7/9),
+   the append-only probe and discontinuity budget (rule 16), and the
+   fact-axis check (rule 15/17) all fire on something the frame *shouldn't*
+   contain: a sibling item, an unnegotiated `_meta` key, a repeated byte run,
+   a fabricated data-loss claim, a declared-but-absent fact. None of them can
+   fail on a frame that's simply missing a fact the producer never declared
+   structurally in the first place — that's a `producerFacts` vacuity
+   (rule 17) one layer removed: `eval` recorded a kernel-timeout/stdin-
+   request annotation **only** by baking it into the model-facing `output`
+   text (`OutputSink.dump(notice)` composes the returned body directly and
+   never calls `onChunk` with it, unlike `push()`, which every other chunk
+   goes through), so `details` had no `notices` field at all — nothing was
+   "missing from what got declared" because nothing was declared
+   (oh-my-pi/oh-my-pi#7078, a later round of the same review; the JS backend
+   only avoided this by calling `push(annotation)` before `dump()`, streaming
+   it live by accident, not by design). `missingFinalBodyLines`
+   (`test/helpers/acp-producer-facts.ts`) closes the omission direction
+   itself: every non-blank line of the producer's own authoritative final
+   body text (`content[].text`, the same text a plain-content client would
+   render verbatim) must appear somewhere across every rendered channel in
+   the *whole* replayed sequence — needing no axis declared first, since it
+   reads the same text a plain fallback client already shows regardless of
+   which structural field (if any) carries a given fact. Wired into
+   `acp-producer-wire.test.ts`'s matrix only, not `acp-event-mapper.test.ts`:
+   the check is only meaningful against a *real* producer's authoritative
+   text, and that suite's ~90 hand-fabricated fixtures have none — wiring it
+   there would test whether a test author's typed string round-trips, not
+   whether real behavior does, the exact anti-pattern rule 15 exists to
+   avoid.
+
+   Three false positives came before the check was trustworthy, each fixed
+   by narrowing what the check demands rather than by weakening it into
+   silence: (1) a bracket mismatch — the model-facing text wraps a
+   `dump(notice)` annotation as `[${notice}]`, but the mirrored
+   `details.notices` entry didn't, so an exact fix landed with the wrong
+   literal and the check still failed until the mirror matched the
+   convention bash's own notices already use; (2) a middle-elided summary
+   (bash's/eval's own tail-buffer rollover, rule 16) legitimately contains
+   thousands of line numbers that were dropped before the mapper ever saw
+   them — check #4's declared discontinuity count already vouches for
+   exactly that loss with the right granularity, so a row with a declared
+   discontinuity skips this check rather than needing a per-line allowance
+   in the thousands; (3) a real client-owned terminal's body streams over
+   the actual `terminal/output` RPC a client polls independently of
+   `session/update`, invisible to an in-process replay by construction, not
+   by omission — rows with a `terminalId` (a real, connection-owned
+   terminal) are exempt for that reason, proven still meaningful by the
+   `stdin requested`/`kernel timeout mid-stream` rows below, which have no
+   `terminalId` and did fail pre-fix. A genuine, documented exception earns
+   `allowUndeliveredFinalLines`; a real loss never does — every exemption
+   above was justified by what the producer/client is structurally
+   incapable of, not chosen to make a red row green. Non-vacuity confirmed
+   twice: the two new rows fail pre-fix with exactly the two annotations
+   named in this rule, pass post-fix, and reverting the fix with the check's
+   exemptions already in place still fails only those rows and nothing else.
+
+   The same "a harness re-implements a checked-elsewhere verdict instead of
+   trusting it, and the reimplementation goes stale" mistake showed up one
+   level up the same day: `scripts/acp-stress-matrix.sh`'s `min=` assertion
+   read only `stress-output`'s parsed `delivered=` byte count against a
+   floor, ignoring the subcommand's own exit code — which was already the
+   authoritative verdict for *both* the byte-shortfall axis (admitted
+   producer cap vs. silent suppression) and the append-only axis (any
+   duplicate terminal delivery fails unconditionally, `acp-probe.ts`'s
+   post-switch check). A duplicate-resend regression *raises* `delivered`
+   rather than shrinking it, so the stale floor-only check reported `PASS`
+   on exactly the shape of bug the exit code was already built to catch —
+   confirmed live by breaking the watermark update on purpose:
+   `delivered=181565 >= 60000` read `OK` under the old logic while the
+   probe's own exit code was `1` (3 duplicate-delivery violations). Fixed by
+   requiring `code == 0` in addition to the floor, restoring the exit code
+   as the single source of truth the floor is now just a display-only sanity
+   check on top of.
+
 ## Running the probe against omp
 
 [`acp-probe`](https://github.com/marton78/acp-probe) is a standalone tool, not vendored in
