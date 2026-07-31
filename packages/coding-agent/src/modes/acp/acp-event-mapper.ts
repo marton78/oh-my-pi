@@ -364,10 +364,28 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					// source has no other home once the terminal item is dropped —
 					// `buildToolStartContent` is the same source-echo the non-meta
 					// path already prepends, so this stays in sync with it for free.
+					//
+					// This branch composes `content` by hand instead of going through
+					// `extractToolCallContent`/`buildFinalMetaTerminalDelta`, so it has
+					// its own obligation to deliver whatever `extractTerminalDeliverableFacts`
+					// collects (`details.notices`/`notice`, a spilled `details.meta`
+					// notice, a framework-level `directText`) — the terminal item it just
+					// dropped was the only channel those facts could otherwise ride via
+					// `_meta.terminal_output`, and there is no such channel left once the
+					// image forces this fallback (oh-my-pi/oh-my-pi#7078 review
+					// 4829715458). `missingNoticeLines` skips whichever facts already
+					// landed verbatim in `finalOutput` (the `details.meta` notice rides
+					// there via `wrapToolWithMetaNotice`'s `appendOutputNotice`), so this
+					// never restates a fact the body already carries.
 					const codeFence = shouldCodeFenceToolOutput(event.toolName);
+					const facts = extractTerminalDeliverableFacts(event.result);
+					const missingFacts = missingNoticeLines(finalOutput, facts);
 					update.content = [
 						...buildToolStartContent(event.toolName, args),
 						...(finalOutput ? [textToolCallContent(codeFence ? fenceCodeBlock(finalOutput) : finalOutput)] : []),
+						...(missingFacts
+							? [textToolCallContent(codeFence ? fenceCodeBlock(missingFacts) : missingFacts)]
+							: []),
 						...images,
 					];
 					// The display-only terminal entity Zed registered at
@@ -1118,9 +1136,10 @@ function buildMetaTerminalDelta(
  * check for a plausible mid-stream roll.
  *
  * Genuinely new facts (wall time, an `artifact://` recovery pointer, a real
- * truncation warning, `eval`'s backend-fallback `details.notice`) always ride
- * through via `extractTerminalNotices` (`details.notices`/`notice` plus the
- * same-source truncation notice a spilled `details.meta` carries), same as
+ * truncation warning, a framework-level note, `eval`'s backend-fallback
+ * `details.notice`) always ride through via `extractTerminalDeliverableFacts`
+ * (`details.notices`/`notice` plus the same-source truncation notice a spilled
+ * `details.meta` carries, plus `directText`), same as
  * `buildLiveTerminalNoticeMeta`, regardless of which branch below fires: the
  * re-render branch sends them on their own, and the two continuation branches
  * append whichever lines the body doesn't already carry itself (bash puts its
@@ -1135,15 +1154,15 @@ function buildFinalMetaTerminalDelta(
 	options: AcpEventMapperOptions,
 ): MetaTerminalOutput | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
-	const notices = extractTerminalNotices(result);
-	// Continuation branches send the body, so only notice lines the body itself
+	const facts = extractTerminalDeliverableFacts(result);
+	// Continuation branches send the body, so only fact lines the body itself
 	// lacks are appended. The re-render/shrink decision below compares the raw
-	// snapshot, never this augmented one — appended notice bytes must not turn
+	// snapshot, never this augmented one — appended fact bytes must not turn
 	// a re-render into an apparent growth.
-	const missingNotices = missingNoticeLines(cumulativeOutput, notices);
-	const withNotices = missingNotices ? `${cumulativeOutput}\n\n${missingNotices}` : cumulativeOutput;
+	const missingFacts = missingNoticeLines(cumulativeOutput, facts);
+	const withFacts = missingFacts ? `${cumulativeOutput}\n\n${missingFacts}` : cumulativeOutput;
 	if (prior === undefined) {
-		return buildMetaTerminalDelta(toolCallId, toolName, args, withNotices, options);
+		return buildMetaTerminalDelta(toolCallId, toolName, args, withFacts, options);
 	}
 	if (cumulativeOutput.length > prior.length) {
 		const rolloverFloorBytes = toolName === "eval" ? DEFAULT_MAX_BYTES * 2 : DEFAULT_MAX_BYTES;
@@ -1151,14 +1170,14 @@ function buildFinalMetaTerminalDelta(
 			deliveredOverlap(prior, cumulativeOutput) > 0 ||
 			(prior.length >= rolloverFloorBytes && !isDisplayReRendered(result));
 		if (isPlausibleContinuation) {
-			return buildMetaTerminalDelta(toolCallId, toolName, args, withNotices, options);
+			return buildMetaTerminalDelta(toolCallId, toolName, args, withFacts, options);
 		}
 	}
 	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
 	// A re-render replaces nothing the user already watched stream, so only the
 	// synthesized facts are left to send — they are never part of the process
 	// byte stream, so they cannot already have been delivered.
-	return notices ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${notices}\n`, options) : undefined;
+	return facts ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${facts}\n`, options) : undefined;
 }
 
 /**
@@ -2019,6 +2038,35 @@ function extractTerminalNotices(value: unknown): string | undefined {
 }
 
 /**
+ * Every fact a client learns *only* from what this frame delivers, in one
+ * place: `extractTerminalNotices` (a producer's `details.notices`/`notice`
+ * plus the rendered `details.meta` notice) and `extractDirectText` (the
+ * framework-level `errorMessage`/`message`/`text` note, e.g. "Permission
+ * request cancelled").
+ *
+ * The two are the same class of fact and were previously collected pairwise at
+ * whichever site remembered both: `buildLiveTerminalNoticeMeta` joined them by
+ * hand, `buildFinalMetaTerminalDelta` read only the notices (so a display-only
+ * meta terminal — every `eval`, `pty: true`, `session/load` replay — dropped
+ * the framework note), and the eval-image content fallback read neither
+ * (oh-my-pi/oh-my-pi#7078 review 4829715458). Every emit path that renders a
+ * terminal, or replaces one, composes through this so a fact added to the
+ * collection point reaches all of them at once instead of the one branch its
+ * reporter happened to name.
+ *
+ * Not used by `extractToolCallContent`'s ordinary-content branch: that path
+ * already appends `directText` itself as its own sibling item, so folding it
+ * into this string there would deliver it twice.
+ */
+function extractTerminalDeliverableFacts(value: unknown): string | undefined {
+	const notices = extractTerminalNotices(value);
+	const directText = extractDirectText(value);
+	if (!directText) return notices;
+	if (notices?.includes(directText)) return notices;
+	return notices ? `${notices}\n\n${directText}` : directText;
+}
+
+/**
  * Re-attach any notice line the plain-content path dropped.
  *
  * A producer appends its notices *after* its output (`bash.ts`'s
@@ -2060,9 +2108,9 @@ function recoverTruncatedNoticeContent(
  * Zed's `on_terminal_provider_event` (`agent_servers/acp.rs`) writes
  * `terminal_output` bytes straight into whatever terminal buffer already owns
  * that id — real or display-only — so this is a one-shot append of
- * `extractTerminalNotices` (bash's own `details.notices` plus the
+ * `extractTerminalDeliverableFacts` (bash's own `details.notices` plus the
  * truncation/artifact-recovery notice a spilled result's `details.meta`
- * carries) plus any framework-level `directText` (e.g. "Permission request
+ * carries, plus any framework-level `directText` such as "Permission request
  * cancelled") onto the *same* terminal id the live command already used,
  * landing inside the same card the process output rendered in (and its
  * "Copy as Markdown" export) instead of a sibling `content` item Zed's
@@ -2086,9 +2134,7 @@ function buildLiveTerminalNoticeMeta(
 	if (!options.terminalMetaCapable) return undefined;
 	const terminalId = extractTerminalId(value);
 	if (!terminalId || !(options.isTerminalLive?.(terminalId) ?? true)) return undefined;
-	const notices = extractTerminalNotices(value);
-	const directText = extractDirectText(value);
-	const combined = [notices, directText].filter((t): t is string => !!t).join("\n\n");
+	const combined = extractTerminalDeliverableFacts(value);
 	if (!combined) return undefined;
 	return buildTerminalMeta(options, {
 		output: buildMetaTerminalOutput(terminalId, toolName, args, `\n${combined}\n`, options),
