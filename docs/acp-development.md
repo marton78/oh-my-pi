@@ -137,6 +137,52 @@ feature adoption alike. Read this before touching ACP code.
    `details.meta`'s notice (via the same `formatOutputNotice` the edit
    branches already use) into every notice-delivery point instead of
    trusting a producer's own `details.notices` push to be complete.
+13. **A one-time header that only one branch composes today will get lost by
+   the next branch that doesn't — brand the payload so a hand-rolled literal
+   is a type error, and add a stream-level guard for what a per-frame check
+   structurally cannot see.** `eval`'s source code has exactly one rendered
+   channel per tool call — meta-terminal bytes if the terminal survives to
+   the final frame, plain `content` text if it doesn't (see
+   `buildMetaTerminalOutput`'s doc comment in `acp-event-mapper.ts`) — because
+   its title is deliberately a short `[lang] cellTitle` label with nowhere
+   else for the source to go. Both known losses of it were a call site
+   hand-rolling `{terminal_id, data}` instead of composing through the one
+   function that knows to prepend the header on first send: the
+   `session/load` dangling-call cleanup in `acp-agent.ts`
+   (oh-my-pi/oh-my-pi#7078 review 4823843361) and the eval-image fallback in
+   `acp-event-mapper.ts`, each on a different round of the same review.
+   `MetaTerminalOutput` is now a nominally branded type — the brand symbol is
+   module-private, so an inline literal fails `check:ts` instead of merely
+   being discouraged, the same enforcement rule 9 already applies to an
+   ungated `_meta.terminal_*` key. But the payload's *body* being correct is
+   a cross-frame property no single-frame check can express: the header can
+   legitimately ride on whichever frame is first in the sequence, so a check
+   that only ever sees one frame at a time has no way to fail a sequence that
+   never sends the header at all — which is exactly the class of bug that
+   shipped, twice, since `checkAcpUpdateInvariants` passed both violating
+   frames.  `EvalSourceDeliveryAuditor` (`acp-update-invariants.ts`)
+   accumulates `_meta.terminal_output.data` and `content` text per tool call
+   across the whole sequence and checks once, when the call reaches a
+   terminal status, that the source it was expected to echo landed somewhere
+   — wired into both `acp-event-mapper.test.ts`'s `mapUpdates()` wrapper and
+   `acp-agent.test.ts`'s replay tests, so both the mapper suite and the
+   suite that actually exercises `#replaySessionHistory` enforce it. A
+   stateful, sequence-level guard is the general shape for this class:
+   whenever "does X ever happen across N frames for the same call" can't be
+   answered by looking at one frame, the guard needs the same per-call
+   accumulation, not a bigger single-frame check.
+
+   This complements, not replaces, rule 8's fixture requirement: the
+   regression test for the dangling-cleanup bug originally used
+   `input: { cells: [] }`, an eval with no source at all —
+   `buildEvalCodeText` degenerates to `undefined` for it, so neither the bug
+   nor the auditor's expectation could ever fire no matter which shape
+   shipped, and the test passed either way. **A fixture that degenerates the
+   feature under test converts an omission into a passing assertion — pick
+   fixture data specific enough that the behavior being tested can actually
+   fail**, the same lesson as review 4821242767's hand-fabricated
+   `details.notices` (rule 12) applied to input shape instead of output
+   shape.
 
 ## Running the probe against omp
 
