@@ -353,10 +353,14 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					// via `_meta.terminal_output` either. A terminal box that hides
 					// the image is strictly worse than a plain content card that
 					// shows everything, so drop the terminal item from this final
-					// update and fall back to ordinary content (fenced text +
-					// images) whenever the result actually produced one.
+					// update and fall back to ordinary content (source + fenced text +
+					// images) whenever the result actually produced one. `eval`'s
+					// source has no other home once the terminal item is dropped —
+					// `buildToolStartContent` is the same source-echo the non-meta
+					// path already prepends, so this stays in sync with it for free.
 					const codeFence = shouldCodeFenceToolOutput(event.toolName);
 					update.content = [
+						...buildToolStartContent(event.toolName, args),
 						...(finalOutput ? [textToolCallContent(codeFence ? fenceCodeBlock(finalOutput) : finalOutput)] : []),
 						...images,
 					];

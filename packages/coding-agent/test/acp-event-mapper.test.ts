@@ -1843,6 +1843,12 @@ describe("ACP event mapper", () => {
 			_meta?: Record<string, unknown>;
 		};
 		expect(end.content).toEqual([
+			// The eval source has no other rendered channel once the terminal
+			// item is dropped from this update (see `buildMetaTerminalOutput`'s
+			// doc comment) — this was the same finding class as the dangling-
+			// replay fix, round 4: `buildToolStartContent` is the same source
+			// echo the non-meta fallback already prepends, kept in sync for free.
+			{ type: "content", content: { type: "text", text: "[py]\nplt.show()" } },
 			{ type: "content", content: { type: "text", text: "```\n(displayed 1 image; no text output)\n```" } },
 			{ type: "content", content: { type: "image", data: imageData, mimeType: "image/png" } },
 		]);
@@ -1889,6 +1895,7 @@ describe("ACP event mapper", () => {
 			}>;
 		};
 		expect(end.content).toEqual([
+			{ type: "content", content: { type: "text", text: "[py]\nplt.show()" } },
 			{ type: "content", content: { type: "text", text: "```\n(displayed 1 image; no text output)\n```" } },
 			{ type: "content", content: { type: "image", data: imageData, mimeType: "image/png" } },
 		]);
