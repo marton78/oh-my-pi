@@ -1239,8 +1239,19 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						outputLines: 0,
 						outputBytes: 0,
 					};
-					this.#throwIfUnfinished(timedOutResult, timeoutSec, this.#formatResultOutput(timedOutResult));
-					throw new ToolError("Command timed out");
+					// Same as every other timeout path (see `#buildCompletedResult`'s
+					// `isTimeout` branch): a timeout is a completed command that
+					// failed, returned as an error *result* carrying its execution
+					// details, not a throw — a throw is turned into
+					// `buildToolErrorResult` (`cursor.ts`), which has no `details`
+					// at all, so every fact a renderer reads structurally (the
+					// timeout annotation and timeout/clamp notices here, plus the
+					// live terminal id below) would be dropped.
+					return this.#buildCompletedResult(timedOutResult, timeoutSec, {
+						requestedTimeoutSec,
+						notices: pendingNotices,
+						wallTimeMs: performance.now() - bridgeWallTimeStart,
+					});
 				}
 
 				handle = createRaced.handle;
@@ -1309,8 +1320,20 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 							outputLines: current.output.length > 0 ? current.output.split("\n").length : 0,
 							outputBytes: current.output.length,
 						};
-						this.#throwIfUnfinished(timedOutResult, timeoutSec, this.#formatResultOutput(timedOutResult));
-						throw new ToolError("Command timed out");
+						// Keep the client-owned terminal id (and the notices) on the
+						// result: the ACP mapper renders this call through that
+						// terminal, and a thrown error carries no `details`, so the
+						// live terminal card would be replaced by a plain text block
+						// at the exact moment the user needs to see why it stopped.
+						const timeoutNotices = current.truncated
+							? ["(output truncated)", ...pendingNotices]
+							: [...pendingNotices];
+						return this.#buildCompletedResult(timedOutResult, timeoutSec, {
+							requestedTimeoutSec,
+							notices: timeoutNotices,
+							terminalId: handle.terminalId,
+							wallTimeMs: performance.now() - bridgeWallTimeStart,
+						});
 					}
 
 					if (raced.kind === "exit") {
