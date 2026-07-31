@@ -103,12 +103,19 @@ feature adoption alike. Read this before touching ACP code.
    find a false zero (or spuriously small, on self-similar bytes) overlap
    and fire the rollover-resync branch even though nothing was lost — a
    false `discontinuity` notice plus a duplicate re-send of already-delivered
-   bytes. `buildFinalMetaTerminalDelta` instead uses a structural invariant:
-   a display re-render can only shrink or preserve what already streamed,
-   never exceed it, so a final snapshot no longer than the watermark is
-   never diffed byte-for-byte — only genuinely new facts (`details.notices`)
-   ride through. Any future producer-side reformatting of a final result is
-   covered by this length check for free; it does not need a new marker.
+   bytes. A re-render that shrinks or preserves length is never diffed
+   byte-for-byte — only genuinely new facts (`details.notices`) ride
+   through. A re-render can also *grow*: `eval` substitutes `(no output)`
+   for an all-whitespace stream, and a failed cell appends a synthesized
+   `Command exited with code N` suffix. Growth is therefore not itself
+   proof of a genuine continuation — it's classified by `deliveredOverlap`
+   finding a real suffix/prefix boundary, or (past the producer's own
+   tail-buffer window) `isDisplayReRendered`'s positive marker from the
+   producer's own `details.meta`, per rule 16. A future producer-side
+   reformatting is covered by this length-plus-marker check for free; it
+   does not need a new marker of its own unless it can *both* grow past the
+   window *and* leave no overlap with what streamed, which is exactly what
+   rule 16 closes.
 11. **A guard has to run where the frames it guards are built and tested,
    or it enforces nothing.** `assertAcpUpdateInvariants` runs at
    `AcpAgent#sendUpdate`, one layer above the mapper — but the bulk of ACP
