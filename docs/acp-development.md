@@ -231,6 +231,39 @@ feature adoption alike. Read this before touching ACP code.
     now returns one, matching its non-bridge path). Adding a producer outcome
     is one table row; adding a new tool with details-only facts means adding
     its row in the same commit.
+16. **Replay the producer's own update stream, not just its final result — and
+    treat the terminal as what it is: an append-only buffer.** A matrix row
+    that feeds only `tool_execution_end` leaves `getMetaTerminalSent` empty, so
+    every frame takes the first-send path and none of the delta/watermark code
+    — the densest source of findings in this subsystem — ever runs. Each row
+    now replays every `onUpdate` snapshot the real producer emitted through the
+    mapper with a live watermark (as `AcpAgent` does), in a `meta` capability
+    mode the matrix originally lacked entirely (`terminalMetaCapable` without a
+    real terminal: `eval` always, `pty: true`, `session/load` replay), and adds
+    two sequence-level checks a single frame cannot express:
+    - **append-only**: no delivery may repeat a substantial run of bytes
+      already sent for that terminal id, because a client concatenates them
+      (Zed's `on_terminal_provider_event`) and the user reads the duplicate;
+    - **a discontinuity budget declared per row**: the mapper may claim dropped
+      bytes only when the producer's own tail buffer genuinely rolled between
+      two snapshots. Anything above the declared count is a fabrication.
+    Both fired on oh-my-pi/oh-my-pi#7078 review 4824091334: past the 50 KB
+    rollover floor, `OutputSink`'s middle-elided final summary starts with the
+    run's *original head* (zero overlap with the streamed tail) and is slightly
+    *longer* than the watermark, so the floor shortcut classified a pure
+    re-render as a rollover — a false `[terminal output discontinuity]` plus a
+    second copy of the whole 51 KB summary. The floor is now additionally gated
+    on `isDisplayReRendered` (the producer's own `details.meta` markers): a
+    positive signal beside the structural length invariant, since a re-render
+    that *grew* has no length signal and its zero overlap is legitimate.
+    **Pick row data that makes the trigger deterministic**: with variable-width
+    lines the streamed watermark landed a byte or two under the floor about a
+    third of the time and the buggy code passed by luck, so the row uses
+    fixed-width 64-byte lines (51,200 / 64 is exact) — and *unique* ones, since
+    self-similar filler makes the append-only probe fire on legitimate
+    deliveries. `acp-probe` enforces the same append-only property on every run
+    against the real wire (`duplicateTerminalDeliveries`/
+    `discontinuityNotices` in its summary, exit 1 on a repeat).
 
 ## Running the probe against omp
 
@@ -263,7 +296,12 @@ probing only, never for a `prompt` that needs to actually reach a model.
 
 For rules 7–10's boundary/regression classes specifically, `acp-probe stress-output
 <bytes>` and `acp-probe kill-mid-tool <text...>` exercise them directly against a real
-`omp acp` process instead of by hand — see acp-probe's README for both.
+`omp acp` process instead of by hand — see acp-probe's README for both. Every probe run
+additionally models each display-only terminal buffer as a client would and fails (exit 1)
+if a delivery repeats bytes already sent for that terminal id, reporting
+`duplicateTerminalDeliveries` and `discontinuityNotices` in its summary — the wire-level
+half of rule 16, and the check that caught a re-sent 51 KB body live before the unit
+matrix did.
 
 Frame logs are the source of truth. Read the literal `content` array, `title`, and `kind`
 sent for the tool call you're working on before changing (or writing) any mapper code.
