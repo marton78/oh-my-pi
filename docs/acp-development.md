@@ -192,14 +192,16 @@ feature adoption alike. Read this before touching ACP code.
     (oh-my-pi/oh-my-pi#7078 review 4823986869: the frame shipped
     `status: "completed"` and a synthesized `_meta.terminal_exit.exit_code:
     0`, i.e. a success check above a terminal that says the command failed).
-    `isFailedToolResult` (`acp-event-mapper.ts`) is the single failure
-    derivation — the same `result.isError ?? details.isError` fallback the TUI
-    renderers already use (`edit/renderer.ts`, `mcp/render.ts`), not a second
-    convention — and `extractExitCode` reads the failing cell's own code, but
-    never invents one (an aborted eval has no exit code anywhere, and a wrong
-    code is worse than none). Because the card's status and its terminal's
-    exit line are two derivations of one result that a user reads together,
-    `checkAcpUpdateInvariants` now fails any frame pairing
+    `toolResultFailed` (`tools/tool-result.ts`) is now the *only* failure
+    derivation, shared by the ACP mapper (`isFailedToolResult`) and the TUI
+    renderers that each used to hand-roll `result.isError ?? details.isError`
+    (`edit/renderer.ts`, `mcp/render.ts`) — a producer that can only mark its
+    failure inside `details` reaches every renderer at once instead of
+    whichever one remembered the fallback. `extractExitCode` reads the failing
+    cell's own code, but never invents one (an aborted eval has no exit code
+    anywhere, and a wrong code is worse than none). Because the card's status
+    and its terminal's exit line are two derivations of one result that a user
+    reads together, `checkAcpUpdateInvariants` now fails any frame pairing
     `status: "completed"` with a nonzero `_meta.terminal_exit.exit_code`;
     the reverse pairing stays legal, since a tool can fail for reasons no
     process exit status expresses. **A fixture that only ever exercises the
@@ -208,6 +210,27 @@ feature adoption alike. Read this before touching ACP code.
     failing eval reports. The producer-seam test (`acp-producer-wire.test.ts`,
     rule 12's mechanism) is what caught it: a real `EvalTool.execute()` with a
     nonzero-exit backend, fed straight into the mapper.
+15. **The producer matrix, not one case per bug: a tool result's facts are only
+    real if a real producer put them there.** Every ACP finding in this PR's
+    review had the same shape — the mapper read field X, the producer recorded
+    the fact in field Y (or discarded it), and ~90 mapper tests fabricated X by
+    hand so nothing could notice. `acp-producer-wire.test.ts` is therefore a
+    table: each row runs a real tool through `wrapToolWithMetaNotice` (as
+    production does) into the mapper, in each capability mode, and every row
+    gets the same three checks — the hand-declared status/exit code for what
+    the command actually did; **no fact the producer recorded structurally
+    (`details.notices`, `details.notice`, `details.meta`'s rendered notice) is
+    missing from the frame**; and `checkAcpUpdateInvariants` passes. That
+    second check is the general form of the artifact-pointer loss (rule 12) and
+    caught two further instances by itself: notices sitting past
+    `ACP_TEXT_LIMIT`'s head truncation on the plain-content path, and a
+    client-terminal timeout whose thrown `ToolError` dropped `details`
+    entirely (`buildToolErrorResult` in `cursor.ts` builds a result with no
+    `details` at all — a producer that throws instead of returning an error
+    *result* loses every structurally-recorded fact, so bash's bridge timeout
+    now returns one, matching its non-bridge path). Adding a producer outcome
+    is one table row; adding a new tool with details-only facts means adding
+    its row in the same commit.
 
 ## Running the probe against omp
 
