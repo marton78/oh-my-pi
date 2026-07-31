@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
@@ -23,7 +23,10 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
-import { checkAcpUpdateInvariants } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-update-invariants";
+import {
+	checkAcpUpdateInvariants,
+	EvalSourceDeliveryAuditor,
+} from "@oh-my-pi/pi-coding-agent/modes/acp/acp-update-invariants";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { formatOutputNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
@@ -42,16 +45,33 @@ import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-sch
  *
  * The capability context is the mapper's own options, so a test can never
  * assert one negotiation state while the check assumes another.
+ *
+ * Also runs `evalSourceAuditor` (rule 13) over the same frames: a per-frame
+ * check has no notion of "the call this frame belongs to", so it cannot
+ * catch a sequence that never once delivers an eval call's own source — the
+ * bug class behind oh-my-pi/oh-my-pi#7078 review 4823843361 and its sibling
+ * in the eval-image fallback. Reset per test in `beforeEach` below so ids
+ * reused across tests (`"tc-1"`, etc.) never leak state between them.
  */
+let evalSourceAuditor = new EvalSourceDeliveryAuditor();
+beforeEach(() => {
+	evalSourceAuditor = new EvalSourceDeliveryAuditor();
+});
+
 function mapUpdates(
 	event: AgentSessionEvent,
 	sessionId: string,
 	options: AcpEventMapperOptions = {},
 ): SessionNotification[] {
+	if ("toolName" in event && "toolCallId" in event) {
+		const args = "args" in event ? event.args : options.getToolArgs?.(event.toolCallId);
+		evalSourceAuditor.expect(event.toolCallId, event.toolName, args);
+	}
 	const updates = mapAgentSessionEventToAcpSessionUpdates(event, sessionId, options);
 	const context = { terminalMetaCapable: options.terminalMetaCapable === true };
 	for (const update of updates) {
 		expect(checkAcpUpdateInvariants(update, context)).toEqual([]);
+		expect(evalSourceAuditor.observe(update)).toEqual([]);
 	}
 	return updates;
 }
