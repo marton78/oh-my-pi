@@ -183,6 +183,31 @@ feature adoption alike. Read this before touching ACP code.
    fail**, the same lesson as review 4821242767's hand-fabricated
    `details.notices` (rule 12) applied to input shape instead of output
    shape.
+14. **A tool's failure can live somewhere other than the result-level
+    `isError` flag — derive the ACP status and the terminal's exit code from
+    the same place, or one of them will lie.** `eval` records a nonzero-exit
+    cell in `details.isError` plus `details.cells[].exitCode` and never calls
+    `.error()` on its result builder, so `tool_execution_end.isError` is
+    `false` for a call whose own output text says `Command exited with code 1`
+    (oh-my-pi/oh-my-pi#7078 review 4823986869: the frame shipped
+    `status: "completed"` and a synthesized `_meta.terminal_exit.exit_code:
+    0`, i.e. a success check above a terminal that says the command failed).
+    `isFailedToolResult` (`acp-event-mapper.ts`) is the single failure
+    derivation — the same `result.isError ?? details.isError` fallback the TUI
+    renderers already use (`edit/renderer.ts`, `mcp/render.ts`), not a second
+    convention — and `extractExitCode` reads the failing cell's own code, but
+    never invents one (an aborted eval has no exit code anywhere, and a wrong
+    code is worse than none). Because the card's status and its terminal's
+    exit line are two derivations of one result that a user reads together,
+    `checkAcpUpdateInvariants` now fails any frame pairing
+    `status: "completed"` with a nonzero `_meta.terminal_exit.exit_code`;
+    the reverse pairing stays legal, since a tool can fail for reasons no
+    process exit status expresses. **A fixture that only ever exercises the
+    success path can't catch this** — every eval fixture in
+    `acp-event-mapper.test.ts` had `exit_code: 0`, so nothing asked what a
+    failing eval reports. The producer-seam test (`acp-producer-wire.test.ts`,
+    rule 12's mechanism) is what caught it: a real `EvalTool.execute()` with a
+    nonzero-exit backend, fed straight into the mapper.
 
 ## Running the probe against omp
 
