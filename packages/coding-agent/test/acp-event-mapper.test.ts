@@ -2076,6 +2076,114 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
+	it("delivers details.notice alongside an eval image in meta-capable mode (oh-my-pi/oh-my-pi#7078 review 4829715458)", () => {
+		// The image fallback composes `content` by hand instead of going through
+		// `extractTerminalDeliverableFacts`'s other two call sites, so a
+		// details-only fact (here `details.notice`, eval's backend-fallback
+		// explanation) rode the terminal item this branch just dropped and had
+		// no other channel — the non-meta path (below) already delivered it.
+		const imageData = "base64-image-data-notice";
+		const result = {
+			content: [
+				{ type: "text", text: "(displayed 1 image; no text output)" },
+				{ type: "image", data: imageData, mimeType: "image/png" },
+			],
+			details: { notice: "Fell back to the js backend." },
+		};
+		const metaEnd = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-image-notice",
+				toolName: "eval",
+				isError: false,
+				result,
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "plt.show()" }) },
+		)[0]!.update as { content?: Array<{ type: string; content?: { type: string; text?: string } }> };
+		const plainEnd = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-image-notice-plain",
+				toolName: "eval",
+				isError: false,
+				result,
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: false, getToolArgs: () => ({ language: "py", code: "plt.show()" }) },
+		)[0]!.update as { content?: Array<{ type: string; content?: { type: string; text?: string } }> };
+		const metaTexts = (metaEnd.content ?? [])
+			.filter(item => item.type === "content" && item.content?.type === "text")
+			.map(item => item.content?.text)
+			.join("\n");
+		const plainTexts = (plainEnd.content ?? [])
+			.filter(item => item.type === "content" && item.content?.type === "text")
+			.map(item => item.content?.text)
+			.join("\n");
+		expect(plainTexts).toContain("Fell back to the js backend.");
+		expect(metaTexts).toContain("Fell back to the js backend.");
+	});
+
+	it("delivers a framework-level errorMessage alongside an eval image in meta-capable mode", () => {
+		const imageData = "base64-image-data-err";
+		const result = {
+			content: [
+				{ type: "text", text: "(displayed 1 image; no text output)" },
+				{ type: "image", data: imageData, mimeType: "image/png" },
+			],
+			details: {},
+			errorMessage: "Permission request cancelled",
+		};
+		const metaEnd = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-image-err",
+				toolName: "eval",
+				isError: false,
+				result,
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "plt.show()" }) },
+		)[0]!.update as { content?: Array<{ type: string; content?: { type: string; text?: string } }> };
+		const metaTexts = (metaEnd.content ?? [])
+			.filter(item => item.type === "content" && item.content?.type === "text")
+			.map(item => item.content?.text)
+			.join("\n");
+		expect(metaTexts).toContain("Permission request cancelled");
+	});
+
+	it("does not double-deliver a details.meta notice already inline in an eval image's rendered output", () => {
+		// `wrapToolWithMetaNotice`'s `appendOutputNotice` writes the
+		// truncation notice into the result's text content directly, so
+		// `extractTerminalStreamText` already carries it in `finalOutput` —
+		// the fact-delivery fix must not restate it as a second content item.
+		const imageData = "base64-image-data-dedupe";
+		const noticeLine = "[Showing lines 2200-5199 of 5199 (187.5KB limit)]";
+		const result = {
+			content: [
+				{ type: "text", text: `some output\n\n${noticeLine}` },
+				{ type: "image", data: imageData, mimeType: "image/png" },
+			],
+			details: { meta: { truncation: { direction: "tail", shownRange: { start: 2200, end: 5199 } } } },
+		};
+		const metaEnd = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-image-dedupe",
+				toolName: "eval",
+				isError: false,
+				result,
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "plt.show()" }) },
+		)[0]!.update as { content?: Array<{ type: string; content?: { type: string; text?: string } }> };
+		const texts = (metaEnd.content ?? [])
+			.filter(item => item.type === "content" && item.content?.type === "text")
+			.map(item => item.content?.text ?? "");
+		const occurrences = texts.join("\n").split(noticeLine).length - 1;
+		expect(occurrences).toBe(1);
+	});
+
 	it("streams cumulative output through the meta-terminal convention on tool_execution_update", () => {
 		const updates = mapUpdates(
 			{
