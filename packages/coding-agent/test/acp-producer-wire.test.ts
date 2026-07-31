@@ -18,11 +18,8 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool, type BashToolDetails } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { executeLaunch } from "@oh-my-pi/pi-coding-agent/tools/hub/launch";
-import {
-	formatOutputNotice,
-	type OutputMeta,
-	wrapToolWithMetaNotice,
-} from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { frameTexts, producerFacts } from "./helpers/acp-producer-facts";
 
 /**
  * Crosses the seam every other ACP test skips: the mapper suite fabricates
@@ -416,6 +413,62 @@ async function runBash(toolCallId: string, args: Record<string, unknown>): Promi
 }
 
 /**
+ * A minimal 1x1 PNG, deterministic and tiny — the actual pixel content is
+ * irrelevant, only that `EvalTool`'s image path (`resizeImage`/`images.push`)
+ * accepts it and the mapper's image-fallback branch fires.
+ */
+const ONE_PIXEL_PNG =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+
+/**
+ * A real `EvalTool.execute()` whose backend produces a display image, so the
+ * meta-terminal image fallback (`tool_execution_end`'s `images.length > 0`
+ * branch) — previously exercised by no matrix row at all — runs through a
+ * real producer instead of only the mapper suite's hand-fabricated fixtures.
+ */
+async function runEvalImage(toolCallId: string): Promise<ProducerOutcome> {
+	stubJsBackend({ output: "", displayOutputs: [{ type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" }] });
+	const args = { language: "js", code: "display(plot)" } as const;
+	const tool = wrapToolWithMetaNotice(new EvalTool(makeEvalSession()));
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "eval", args: { ...args }, result, updates };
+}
+
+/**
+ * A real `EvalTool.execute()` via its `proxyExecutor` constructor option
+ * (`eval.ts`'s `#proxyExecutor` branch, an existing production seam for
+ * MCP-proxied eval-shaped tools) returning `details.notice` — the only
+ * honest way to populate that field through a real producer entrypoint,
+ * since `ResolvedBackend.notice` (the ordinary cell-resolution path's
+ * writer) has no caller anywhere in `src/`.
+ *
+ * Deliberately does *not* also return an image: `EvalProxyExecutor`'s own
+ * declared return type (`EvalToolResult`) restricts `content` to
+ * `{type:"text"}` — no typed production entrypoint can combine an image
+ * with a proxy-sourced notice, confirmed by `tsgo` rejecting the combined
+ * shape outright. That combination is real and fixed (see the mapper-level
+ * regression tests in `acp-event-mapper.test.ts` for
+ * oh-my-pi/oh-my-pi#7078 review 4829715458), just not reachable through any
+ * single typed producer this matrix can construct — this row instead
+ * covers the `details.notice` axis on its own, honestly.
+ */
+async function runEvalProxyNotice(toolCallId: string): Promise<ProducerOutcome> {
+	const args = { language: "js", code: "someFallbackApi()" } as const;
+	const tool = wrapToolWithMetaNotice(
+		new EvalTool(null, {
+			proxyExecutor: async () => ({
+				content: [{ type: "text", text: "ok" }],
+				details: { notice: "Fell back to the js backend." },
+			}),
+		}),
+	);
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "eval", args: { ...args }, result, updates };
+}
+
+/**
  * A client-owned terminal that never exits, so the tool's own timeout fires
  * while the terminal is live — the one bash path that used to throw instead of
  * returning a result, discarding `details.terminalId` and every notice with it.
@@ -586,6 +639,18 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		discontinuities: 1,
 	},
 	{
+		name: "eval, image display output",
+		run: runEvalImage,
+		status: "completed",
+		exitCode: 0,
+	},
+	{
+		name: "eval via proxyExecutor, details.notice",
+		run: runEvalProxyNotice,
+		status: "completed",
+		exitCode: 0,
+	},
+	{
 		name: "hub start, daemon reported failed",
 		run: () => runLaunch("start", "failed"),
 		status: "failed",
@@ -601,44 +666,6 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		status: "failed",
 	},
 ];
-
-/** Every string a producer recorded structurally for a renderer to surface. */
-function producerFacts(result: AgentToolResult<unknown>): string[] {
-	const details = result.details;
-	if (typeof details !== "object" || details === null) return [];
-	const facts: string[] = [];
-	const notices = (details as { notices?: unknown }).notices;
-	if (Array.isArray(notices)) {
-		for (const notice of notices) if (typeof notice === "string") facts.push(notice);
-	}
-	const single = (details as { notice?: unknown }).notice;
-	if (typeof single === "string") facts.push(single);
-	const meta = (details as { meta?: OutputMeta }).meta;
-	if (meta) facts.push(formatOutputNotice(meta));
-	return facts.flatMap(fact =>
-		fact
-			.split("\n")
-			.map(line => line.trim())
-			.filter(line => line.length > 0),
-	);
-}
-
-/** Every text channel the client can actually render for this frame. */
-function frameTexts(update: Record<string, unknown>): string[] {
-	const texts: string[] = [];
-	const meta = update._meta as { terminal_output?: { data?: unknown } } | undefined;
-	if (typeof meta?.terminal_output?.data === "string") texts.push(meta.terminal_output.data);
-	const content = update.content;
-	if (Array.isArray(content)) {
-		for (const item of content) {
-			if (item?.type === "content" && item.content?.type === "text" && typeof item.content.text === "string") {
-				texts.push(item.content.text);
-			}
-			if (item?.type === "diff") texts.push(String(item.newText ?? ""));
-		}
-	}
-	return texts;
-}
 
 /**
  * Bytes a client would append to the display-only terminal, in delivery order.
@@ -762,4 +789,44 @@ describe("ACP producer matrix", () => {
 			});
 		}
 	}
+});
+
+/**
+ * The failure mode this guards against: `producerFacts` declares three
+ * axes (`details.notices`, `details.notice`, `details.meta`), but check #2
+ * above is vacuous on any axis no row's *real* result populates — exactly
+ * how `details.notice` shipped uncovered for the whole life of this matrix
+ * (oh-my-pi/oh-my-pi#7078 review 4829715458): the axis was declared, the
+ * check read it, and nothing ever failed because no row's producer ever set
+ * it. Asserting non-vacuity here, once, is cheaper than re-discovering it
+ * from a missed bug every time a new axis is declared.
+ *
+ * The top-level `errorMessage`/`message`/`text` (`directText`) axis is
+ * deliberately not required here: within this matrix's scope (a single
+ * `AgentTool.execute()` result), no producer sets it — the one real
+ * instance, "Permission request cancelled", is synthesized a layer above
+ * `tool.execute()` (the agent loop's permission-cancellation catch,
+ * `cursor.ts`/`session-tools.ts`), never inside a tool result the matrix
+ * can construct by calling a tool directly. That axis is covered instead by
+ * `acp-event-mapper.test.ts`'s hand-fabricated fixtures, which is the
+ * correct place for a framework-level fact no tool producer emits.
+ */
+describe("ACP producer matrix vacuity guard", () => {
+	it("every declared details-fact axis is populated by at least one row's real result", async () => {
+		let sawNotices = false;
+		let sawNotice = false;
+		let sawMeta = false;
+		for (const producerCase of PRODUCER_CASES) {
+			const outcome = await producerCase.run(`vacuity-${producerCase.name.replace(/[^a-z0-9]+/gi, "-")}`);
+			const details = outcome.result.details;
+			if (typeof details !== "object" || details === null) continue;
+			if ("notices" in details && Array.isArray((details as { notices?: unknown }).notices)) {
+				const notices = (details as { notices?: unknown[] }).notices ?? [];
+				if (notices.length > 0) sawNotices = true;
+			}
+			if (typeof (details as { notice?: unknown }).notice === "string") sawNotice = true;
+			if ((details as { meta?: unknown }).meta) sawMeta = true;
+		}
+		expect({ sawNotices, sawNotice, sawMeta }).toEqual({ sawNotices: true, sawNotice: true, sawMeta: true });
+	});
 });
