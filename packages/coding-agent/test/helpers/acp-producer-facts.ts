@@ -95,3 +95,68 @@ export function frameTexts(update: Record<string, unknown>): string[] {
 	}
 	return texts;
 }
+
+/**
+ * The tool's own authoritative final body text — `content[].text` blocks
+ * joined, the same text a plain-content fallback client would render
+ * verbatim. This is deliberately NOT `producerFacts` (which only reads
+ * structurally-declared fields like `details.notices`): a producer can
+ * compose a synthesized note directly into this text (an executor's
+ * `dump(notice)` annotation, `eval`'s synthesized `Command exited with code
+ * N` suffix) without ever declaring it as a separate structural fact, so a
+ * check confined to `producerFacts` is vacuous on exactly that class of bug
+ * (oh-my-pi/oh-my-pi#7078 review r3693523855 — the producer's `details`
+ * simply had no `notices` field at all pre-fix, so nothing was "missing"
+ * from a check that only compares against what got declared).
+ */
+export function producerFinalBodyText(result: AgentToolResult<unknown> | Record<string, unknown>): string {
+	if (typeof result !== "object" || result === null) return "";
+	const content = "content" in result ? (result as { content?: unknown }).content : undefined;
+	if (!Array.isArray(content)) return "";
+	const texts: string[] = [];
+	for (const item of content) {
+		if (typeof item !== "object" || item === null) continue;
+		if ("text" in item && typeof (item as { text?: unknown }).text === "string") {
+			texts.push((item as { text: string }).text);
+		}
+	}
+	return texts.join("\n");
+}
+
+/**
+ * Every non-blank line of `finalBodyText` that appears nowhere in
+ * `deliveredTexts` (every `_meta.terminal_output.data` chunk plus every
+ * rendered `content` text, across the *whole* replayed frame sequence, not
+ * just the last frame — a line legitimately delivered on an earlier
+ * `tool_execution_update` and never repeated on the final frame is not
+ * missing). The general form of the class this PR kept re-finding one
+ * instance at a time: a fact synthesized straight into the model-facing text
+ * (never declared structurally) that the terminal-rendering path — which
+ * reads only structured facts — silently drops. Unlike `producerFacts`,
+ * this needs no axis to be declared first: it reads the same authoritative
+ * text a plain-content client would show, so an omission fails regardless of
+ * which structural field (if any) the producer used to carry it.
+ *
+ * A short-line-prefix match (first 40 chars) additionally tolerates
+ * legitimate per-line column truncation (`tools.maxColumn`) without
+ * requiring the caller to enumerate every normalization a producer might
+ * apply — the same "structural, not enumerated" approach rule 10 takes for
+ * re-render classification.
+ */
+export function missingFinalBodyLines(finalBodyText: string, deliveredTexts: readonly string[]): string[] {
+	const delivered = deliveredTexts.join("\n");
+	// Exact-line lookup is O(1) amortized via the Set, so a long streamed body
+	// (thousands of lines) stays linear; only the rare line with no exact match
+	// (e.g. one a client-side column truncation shortened) pays the O(delivered
+	// length) substring scan below, bounded by how many such lines exist.
+	const deliveredLines = new Set(delivered.split("\n"));
+	return finalBodyText
+		.split("\n")
+		.map(line => line.trim())
+		.filter(line => line.length > 0)
+		.filter(line => {
+			if (deliveredLines.has(line) || delivered.includes(line)) return false;
+			const prefix = line.slice(0, 40);
+			return prefix.length < 8 ? true : !delivered.includes(prefix);
+		});
+}

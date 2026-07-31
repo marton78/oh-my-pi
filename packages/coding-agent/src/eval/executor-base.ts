@@ -37,7 +37,24 @@ export interface KernelExecutorBaseOptions {
 	artifactPath?: string;
 }
 
-/** Normalised execution result produced by {@link executeWithKernelBase}. */
+/**
+ * Normalised execution result produced by {@link executeWithKernelBase}.
+ *
+ * `annotation`, when set, is the same synthesized note `dump(notice)` already
+ * baked into `output` as a head-prefixed `[notice]\n` line (kernel timeout/
+ * kill, or a stdin request) — surfaced here as a second, structural copy so a
+ * caller can deliver it through a channel `OutputSink`'s own `onChunk` never
+ * reaches. `dump()` composes the returned body directly; it does not call
+ * `onChunk` with the notice line, unlike `push()`, which every other chunk
+ * goes through. So a `sink.push(text); … ; sink.dump()` producer (this file's
+ * only caller, the JS backend's own executor) streams its annotation live
+ * into whatever tail buffer `onChunk` feeds, while a `sink.dump(notice)`
+ * producer (every kernel-backed language here) does not — the annotation
+ * only ever reaches the model-facing text, never a client's terminal watermark
+ * (oh-my-pi/oh-my-pi#7078 review r3693523855). `annotation` lets a caller
+ * mirror it into a structural notice field (`EvalToolDetails.notices`) instead
+ * of changing `dump()`'s streaming behavior or the text it composes.
+ */
 export interface KernelExecutionResult {
 	output: string;
 	exitCode: number | undefined;
@@ -50,6 +67,7 @@ export interface KernelExecutionResult {
 	outputBytes: number;
 	displayOutputs: KernelDisplayOutput[];
 	stdinRequested: boolean;
+	annotation?: string;
 }
 
 /** Minimal kernel surface the base executor drives, satisfied by every backend kernel. */
@@ -477,11 +495,13 @@ export async function executeWithKernelBase<
 				outputBytes: dumped.outputBytes,
 				displayOutputs,
 				stdinRequested: !!result.stdinRequested,
+				annotation,
 			};
 		}
 
 		if (result.stdinRequested) {
-			const dumped = await sink.dump("Kernel requested stdin; interactive input is not supported.");
+			const annotation = "Kernel requested stdin; interactive input is not supported.";
+			const dumped = await sink.dump(annotation);
 			return {
 				exitCode: 1,
 				cancelled: false,
@@ -494,6 +514,7 @@ export async function executeWithKernelBase<
 				outputBytes: dumped.outputBytes,
 				displayOutputs,
 				stdinRequested: true,
+				annotation,
 			};
 		}
 
@@ -515,9 +536,10 @@ export async function executeWithKernelBase<
 	} catch (err) {
 		if (isCancellationError(err, cancelledErrorClass) || abortShield.abortRequested || abortShield.signal?.aborted) {
 			const timedOut = abortShield.timedOut || isTimedOutCancellation(err, cancelledErrorClass, abortShield.signal);
-			const dumped = await sink.dump(
-				timedOut ? formatTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs) : undefined,
-			);
+			const annotation = timedOut
+				? formatTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs)
+				: undefined;
+			const dumped = await sink.dump(annotation);
 			return {
 				exitCode: undefined,
 				cancelled: true,
@@ -530,6 +552,7 @@ export async function executeWithKernelBase<
 				outputBytes: dumped.outputBytes,
 				displayOutputs,
 				stdinRequested: false,
+				annotation,
 			};
 		}
 		const error = err instanceof Error ? err : new Error(String(err));

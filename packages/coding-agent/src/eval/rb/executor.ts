@@ -95,6 +95,8 @@ export interface RubyResult {
 	outputBytes: number;
 	displayOutputs: KernelDisplayOutput[];
 	stdinRequested: boolean;
+	/** See `KernelExecutionResult`'s doc comment (executor-base.ts). */
+	annotation?: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
+import { executePythonWithKernel } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import type { EvalToolDetails } from "@oh-my-pi/pi-coding-agent/eval/types";
 import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
 import * as daemonClient from "@oh-my-pi/pi-coding-agent/launch/client";
@@ -19,7 +20,7 @@ import { BashTool, type BashToolDetails } from "@oh-my-pi/pi-coding-agent/tools/
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { executeLaunch } from "@oh-my-pi/pi-coding-agent/tools/hub/launch";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
-import { frameTexts, producerFacts } from "./helpers/acp-producer-facts";
+import { frameTexts, missingFinalBodyLines, producerFacts, producerFinalBodyText } from "./helpers/acp-producer-facts";
 
 /**
  * Crosses the seam every other ACP test skips: the mapper suite fabricates
@@ -328,6 +329,16 @@ interface ProducerCase {
 	 * is a fabrication.
 	 */
 	discontinuities?: number;
+	/**
+	 * How many non-blank lines of the producer's own final body text
+	 * (`producerFinalBodyText`) may legitimately never reach the client on any
+	 * rendered channel. Declared per row, default 0 — a real omission (this
+	 * PR's own eval-annotation regression, oh-my-pi/oh-my-pi#7078 review
+	 * r3693523855) is never an allowance to grant, only a `plain` mode's own
+	 * `ACP_TEXT_LIMIT` head truncation on a body that exceeds it legitimately
+	 * earns one.
+	 */
+	allowUndeliveredFinalLines?: number;
 	modes?: readonly ModeName[];
 }
 
@@ -392,6 +403,91 @@ async function runStreamingEval(toolCallId: string, lines: number): Promise<Prod
 			totalBytes: output.length,
 			outputLines: lines,
 			outputBytes: output.length,
+			displayOutputs: [],
+		};
+	}) as never);
+	const args = { language: "js", code: "for (const l of lines) print(l)" } as const;
+	const tool = wrapToolWithMetaNotice(new EvalTool(makeEvalSession()));
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "eval", args: { ...args }, result, updates };
+}
+
+/**
+ * A real `EvalTool.execute()` through the Python backend's *actual* kernel
+ * seam (`executePythonWithKernel`, `executor-base.ts`), not the JS backend
+ * stub every other row uses. This is the seam that produced
+ * oh-my-pi/oh-my-pi#7078 review r3693523855: `OutputSink.dump(notice)` bakes
+ * a kernel-timeout/stdin-requested annotation into the returned `output`
+ * text but never calls `onChunk` with it, so a matrix confined to the JS
+ * backend (which instead calls `push(annotation)` before `dump()`, streaming
+ * it live) could never observe the asymmetry. `chunks` stream through the
+ * fake kernel's own `onChunk` before it reports the outcome, so the frame
+ * sequence has real prior deliveries to diff the final annotation-bearing
+ * snapshot against — exactly how the bug manifested (a short annotation
+ * prefixed onto already-streamed text, zero overlap, classified as a
+ * re-render, and dropped).
+ */
+async function runEvalPythonKernel(
+	toolCallId: string,
+	chunks: readonly string[],
+	outcome: { cancelled?: boolean; timedOut?: boolean; stdinRequested?: boolean; status?: "ok" | "error" },
+): Promise<ProducerOutcome> {
+	vi.spyOn(evalIndex.pythonBackend, "isAvailable").mockImplementation((async () => true) as never);
+	vi.spyOn(evalIndex.pythonBackend, "execute").mockImplementation((async (
+		code: string,
+		options: Record<string, unknown>,
+	) => {
+		const kernel = {
+			execute: async (_code: string, opts: { onChunk?: (text: string) => void }) => {
+				for (const chunk of chunks) opts.onChunk?.(chunk);
+				return {
+					status: outcome.status ?? "error",
+					cancelled: outcome.cancelled ?? false,
+					timedOut: outcome.timedOut ?? false,
+					stdinRequested: outcome.stdinRequested ?? false,
+					kernelKilled: false,
+				};
+			},
+		};
+		return await executePythonWithKernel(kernel as never, code, options as never);
+	}) as never);
+	const args = { language: "py", code: "print('streamed'); input()" } as const;
+	const tool = wrapToolWithMetaNotice(new EvalTool(makeEvalSession()));
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "eval", args: { ...args }, result, updates };
+}
+
+/**
+ * The abort/cancellation row streamed through a real cancellation (not just a
+ * hand-fabricated `cancelled: true` final result): `chunks` deliver through
+ * `onChunk` first, so `getMetaTerminalSent` is non-empty when the mapper
+ * reaches `tool_execution_end` and the grow/re-render classifier in
+ * `buildFinalMetaTerminalDelta` actually runs on a *failure* row, not only on
+ * the success-only streaming row above it (`runStreamingEval`). Before this,
+ * every streamed row in this matrix ended in success; a matrix that never
+ * feeds the delta classifier a failing final snapshot can't catch a class of
+ * bug that only shows up there (this exact one: an annotation-prefixed final
+ * snapshot after real streamed output).
+ */
+async function runStreamingEvalAborted(toolCallId: string, chunks: readonly string[]): Promise<ProducerOutcome> {
+	const streamed = chunks.join("");
+	vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation((async (
+		_code: string,
+		options: { onChunk?: (chunk: string) => void },
+	) => {
+		for (const chunk of chunks) options.onChunk?.(chunk);
+		return {
+			output: `${streamed}\nCommand aborted`,
+			exitCode: undefined,
+			cancelled: true,
+			truncated: false,
+			artifactId: undefined,
+			totalLines: chunks.length,
+			totalBytes: streamed.length,
+			outputLines: chunks.length,
+			outputBytes: streamed.length,
 			displayOutputs: [],
 		};
 	}) as never);
@@ -626,8 +722,38 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 	},
 	{
 		name: "eval, aborted mid-cell",
-		run: id => runEval(id, { output: "partial\n", cancelled: true }),
+		// Streamed through a real cancellation (not a hand-fabricated final
+		// result): the aggregate `output` grows past the watermark with
+		// "\nCommand aborted" appended, so this row also exercises
+		// `buildFinalMetaTerminalDelta`'s grow/re-render classifier on a
+		// *failure*, which no row did before this (every other streamed row
+		// ends in success).
+		run: id => runStreamingEvalAborted(id, ["aborted-cell-line-1\n", "aborted-cell-line-2\n"]),
 		status: "failed",
+	},
+	{
+		name: "eval via python kernel, kernel timeout mid-stream",
+		// The seam behind oh-my-pi/oh-my-pi#7078 review r3693523855:
+		// `executeWithKernelBase`'s cancelled/timed-out branch calls
+		// `sink.dump(annotation)`, which bakes the annotation into `output`
+		// without ever streaming it through `onChunk` — unlike the JS backend
+		// stub every other eval row here uses, which calls `push()` before
+		// `dump()`. Chunks stream first so the annotation-bearing final
+		// snapshot has real prior deliveries to diff against.
+		run: id =>
+			runEvalPythonKernel(id, ["streamed-py-line-1\n", "streamed-py-line-2\n"], {
+				cancelled: true,
+				timedOut: true,
+			}),
+		status: "failed",
+	},
+	{
+		name: "eval via python kernel, stdin requested",
+		// Same seam, the other `dump(notice)` call site
+		// (`executor-base.ts`'s `stdinRequested` branch, `exitCode: 1`).
+		run: id => runEvalPythonKernel(id, ["streamed-py-stdin-1\n"], { stdinRequested: true, status: "ok" }),
+		status: "failed",
+		exitCode: 1,
 	},
 	{
 		name: "eval, streamed past its own tail-buffer window",
@@ -664,6 +790,11 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		name: "edit, multi-file patch with one missing file",
 		run: runPartiallyFailingEdit,
 		status: "failed",
+		// The succeeded file's own "Files already applied: a.txt." ack is
+		// intentionally suppressed once its diff is already shown below it —
+		// stated PR intent ("succeeded files' ack text is no longer repeated
+		// below their diffs"), not an omission this check should flag.
+		allowUndeliveredFinalLines: 1,
 	},
 ];
 
@@ -677,7 +808,7 @@ function replayThroughMapper(
 	toolCallId: string,
 	outcome: ProducerOutcome,
 	mode: (typeof MODES)[ModeName],
-): { frames: SessionNotification[]; terminalChunks: string[] } {
+): { frames: SessionNotification[]; terminalChunks: string[]; allDeliveredTexts: string[] } {
 	const watermarks = new Map<string, string>();
 	const options = {
 		...mode,
@@ -717,11 +848,20 @@ function replayThroughMapper(
 	);
 	frames.push(...endFrames);
 	const terminalChunks: string[] = [];
+	// Every rendered channel across the *whole* sequence, not just the last
+	// frame: a line delivered on an earlier `tool_execution_update` and never
+	// repeated on the final frame is not missing (`missingFinalBodyLines`
+	// reads this, not just the end frame's own texts).
+	const allDeliveredTexts: string[] = [];
 	for (const frame of frames) {
 		const meta = (frame.update as { _meta?: { terminal_output?: { data?: unknown } } })._meta;
-		if (typeof meta?.terminal_output?.data === "string") terminalChunks.push(meta.terminal_output.data);
+		if (typeof meta?.terminal_output?.data === "string") {
+			terminalChunks.push(meta.terminal_output.data);
+			allDeliveredTexts.push(meta.terminal_output.data);
+		}
+		allDeliveredTexts.push(...frameTexts(frame.update as unknown as Record<string, unknown>));
 	}
-	return { frames: endFrames, terminalChunks };
+	return { frames: endFrames, terminalChunks, allDeliveredTexts };
 }
 
 const DISCONTINUITY_MARKER = "terminal output discontinuity";
@@ -751,7 +891,7 @@ describe("ACP producer matrix", () => {
 				const toolCallId = `matrix-${producerCase.name.replace(/[^a-z0-9]+/gi, "-")}-${modeName}`;
 				const outcome = await producerCase.run(toolCallId);
 				const mode = MODES[modeName];
-				const { frames, terminalChunks } = replayThroughMapper(toolCallId, outcome, mode);
+				const { frames, terminalChunks, allDeliveredTexts } = replayThroughMapper(toolCallId, outcome, mode);
 				expect(frames).toHaveLength(1);
 				const update = frames[0]!.update as unknown as Record<string, unknown>;
 
@@ -786,6 +926,32 @@ describe("ACP producer matrix", () => {
 
 				// 5. Wire invariants, same check `AcpAgent#sendUpdate` runs.
 				expect(checkAcpUpdateInvariants(frames[0]!, { terminalMetaCapable: mode.terminalMetaCapable })).toEqual([]);
+
+				// 6. No line of the producer's own final body text vanished on
+				// every rendered channel across the sequence. Unlike check #2,
+				// this needs no axis declared first — it reads the same
+				// authoritative text a plain-content client would show, so a
+				// fact synthesized straight into that text (never declared as a
+				// separate structural field) still has to survive somewhere.
+				// Exempt rows with a real client-owned terminal (`terminalId`):
+				// their body is delivered out-of-band over the actual
+				// `terminal/output` RPC channel a client polls independently of
+				// `session/update`, which this in-process replay never sees —
+				// checking against it would be a structural false positive, not
+				// a signal.
+				// Skip for rows with a real client-owned terminal (out-of-band
+				// delivery, above) *or* a declared discontinuity: check #4
+				// already independently vouches for that exact loss, with the
+				// right granularity (a bounded, honest discontinuity count),
+				// not a byte-for-byte line diff against a middle-elided summary
+				// that can legitimately span thousands of line numbers.
+				if (!producerCase.terminalId && !producerCase.discontinuities) {
+					const finalBodyText = producerFinalBodyText(outcome.result);
+					const missing = missingFinalBodyLines(finalBodyText, allDeliveredTexts);
+					expect(missing.length, `undelivered final-body lines: ${JSON.stringify(missing)}`).toBeLessThanOrEqual(
+						producerCase.allowUndeliveredFinalLines ?? 0,
+					);
+				}
 			});
 		}
 	}

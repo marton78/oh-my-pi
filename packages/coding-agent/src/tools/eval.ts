@@ -449,6 +449,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				const jsonOutputs: unknown[] = [];
 				const images: ImageContent[] = [];
 				const statusEvents: EvalStatusEvent[] = [];
+				// Executor-synthesized notes (kernel timeout/kill, a stdin request)
+				// mirrored from `ExecutorBackendResult.annotation`: `dump(notice)`
+				// bakes them into the model-facing `output` text but never streams
+				// them through `onChunk`, so the ACP terminal path — which reads only
+				// structured facts — would otherwise lose the reason a cell stopped
+				// (oh-my-pi/oh-my-pi#7078 review r3693523855). Same convention as
+				// `BashToolDetails.notices`.
+				const cellNotices: string[] = [];
 
 				const cellResults: EvalCellResult[] = cells.map(cell => ({
 					index: cell.index,
@@ -508,6 +516,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					}
 					if (notice) {
 						details.notice = notice;
+					}
+					if (cellNotices.length > 0) {
+						details.notices = [...cellNotices];
 					}
 					return details;
 				};
@@ -608,6 +619,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						activeLiveCell = undefined;
 					}
 					const durationMs = Date.now() - startTime;
+					if (result.annotation) cellNotices.push(`[${result.annotation}]`);
 
 					const cellStatusEvents: EvalStatusEvent[] = [];
 					const cellDisplayOutputs: EvalDisplayOutput[] = [];
@@ -692,6 +704,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							isError: true,
 						};
 						if (notice) details.notice = notice;
+						if (cellNotices.length > 0) details.notices = [...cellNotices];
 
 						return toolResult(details)
 							.content([{ type: "text", text: outputText }, ...images])
@@ -703,9 +716,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						cellResult.status = "error";
 						pushUpdate();
 						const combinedOutput = cellOutputs.join("\n\n");
-						const outputText = combinedOutput
-							? `${combinedOutput}\n\nCommand exited with code ${result.exitCode}`
-							: `Command exited with code ${result.exitCode}`;
+						const exitNotice = `Command exited with code ${result.exitCode}`;
+						const outputText = combinedOutput ? `${combinedOutput}\n\n${exitNotice}` : exitNotice;
+						cellNotices.push(exitNotice);
 
 						const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 						const details: EvalToolDetails = {
@@ -717,6 +730,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							isError: true,
 						};
 						if (notice) details.notice = notice;
+						if (cellNotices.length > 0) details.notices = [...cellNotices];
 
 						return toolResult(details)
 							.content([{ type: "text", text: outputText }, ...images])
@@ -745,6 +759,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 				};
 				if (notice) details.notice = notice;
+				if (cellNotices.length > 0) details.notices = [...cellNotices];
 
 				return toolResult(details)
 					.content([{ type: "text", text: outputText }, ...images])
