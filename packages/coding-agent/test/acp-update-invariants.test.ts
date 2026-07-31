@@ -87,6 +87,48 @@ describe("checkAcpUpdateInvariants", () => {
 		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: false })).toEqual([]);
 	});
 
+	it("flags a nonzero terminal exit reported with a completed status (rule 14)", () => {
+		// oh-my-pi/oh-my-pi#7078 review 4823986869: the card's status and its
+		// terminal's exit line are two derivations of the same result; a user
+		// reads them together, so a success check above "exit code 1" is a
+		// self-contradicting frame.
+		const notification = toolCallUpdate({
+			status: "completed",
+			content: [{ type: "terminal", terminalId: "call-1" }],
+			_meta: { terminal_exit: { terminal_id: "call-1", exit_code: 1, signal: null } },
+		});
+
+		const violations = checkAcpUpdateInvariants(notification, { terminalMetaCapable: true });
+
+		expect(violations).toHaveLength(1);
+		expect(violations[0]).toContain("exit_code 1");
+	});
+
+	it("allows a failed status with a nonzero exit, and a completed status with exit 0", () => {
+		const failed = toolCallUpdate({
+			status: "failed",
+			_meta: { terminal_exit: { terminal_id: "call-1", exit_code: 1, signal: null } },
+		});
+		const completed = toolCallUpdate({
+			status: "completed",
+			_meta: { terminal_exit: { terminal_id: "call-1", exit_code: 0, signal: null } },
+		});
+
+		expect(checkAcpUpdateInvariants(failed, { terminalMetaCapable: true })).toEqual([]);
+		expect(checkAcpUpdateInvariants(completed, { terminalMetaCapable: true })).toEqual([]);
+	});
+
+	it("allows a failed status with no exit code at all (an aborted call)", () => {
+		// A tool can fail for reasons no process exit status expresses, so the
+		// reverse pairing is deliberately not checked.
+		const notification = toolCallUpdate({
+			status: "failed",
+			_meta: { terminal_exit: { terminal_id: "call-1", signal: null } },
+		});
+
+		expect(checkAcpUpdateInvariants(notification, { terminalMetaCapable: true })).toEqual([]);
+	});
+
 	it("ignores session updates that aren't tool calls", () => {
 		const notification: SessionNotification = {
 			sessionId: "session-1",
