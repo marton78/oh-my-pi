@@ -14,6 +14,7 @@ import { DEFAULT_MAX_BYTES } from "../../session/streaming-output";
 import { formatOutputNotice, type OutputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
+import { toolResultFailed } from "../../tools/tool-result";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 
 interface MessageProgress {
@@ -1244,17 +1245,17 @@ function isPtyRequested(args: unknown): boolean {
  * (see `eval.ts`'s nonzero-exit and cancelled branches), so the event's
  * `isError` is false for a call whose own output text says `Command exited
  * with code 1`. Reporting that as `status: "completed"` with a synthesized
- * `exit_code: 0` makes both the card and its terminal claim success. The TUI
- * renderers already fall back to `details.isError` for exactly this reason
- * (`edit/renderer.ts`, `mcp/render.ts`) — same fallback here, not a second
- * convention. Every other producer sets the result-level flag too (or
- * both, as `mcp/tool-bridge.ts` does), so this only ever adds failures the
- * result already admits to.
+ * `exit_code: 0` makes both the card and its terminal claim success.
+ *
+ * The details half is `toolResultFailed` (`tools/tool-result.ts`) — the one
+ * derivation the TUI renderers use too, so a producer that can only mark its
+ * failure in `details` reaches every renderer at once instead of whichever
+ * ones remembered the fallback.
  */
 function isFailedToolResult(value: unknown, isError: boolean | undefined): boolean {
 	if (isError === true) return true;
-	const details = toolResultDetails(value);
-	return details !== undefined && "isError" in details && details.isError === true;
+	if (typeof value !== "object" || value === null) return false;
+	return toolResultFailed(value);
 }
 
 /** The `details` object of a tool result, when it has one. */

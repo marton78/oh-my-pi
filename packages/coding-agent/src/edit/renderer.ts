@@ -28,6 +28,7 @@ import {
 	shortenPath,
 	truncateDiffByHunk,
 } from "../tools/render-utils";
+import { toolResultFailed } from "../tools/tool-result";
 import {
 	fileHyperlink,
 	framedBlock,
@@ -826,7 +827,7 @@ function renderSingleFileResult(
 	args?: EditRenderArgs,
 ): Component {
 	const details = result.details;
-	const isError = result.isError ?? (details && "isError" in details ? details.isError : false);
+	const isError = toolResultFailed(result);
 	const edits = Array.isArray(args?.edits) ? args.edits : undefined;
 	const firstEdit = edits?.[0];
 	const hashlineInputSummary = getHashlineInputRenderSummary(args ?? {}, options.renderContext?.editMode);
