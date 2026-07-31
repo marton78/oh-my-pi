@@ -103,6 +103,9 @@
 - Fixed the Python RPC client dropping context, compaction, OAuth URL, and terminal-settlement fields.
 - Fixed the browser tool ignoring the url parameter when opening a new tab on an attached browser.
 - Fixed browser automation disrupting attached browsers by adopting the active foreground tab and avoiding raising new tabs during screenshots.
+### Fixed
+
+- Fixed an ACP `eval` call's source code silently disappearing from the client-rendered card in two remaining cases: a `session/load` replay of an interrupted (dangling) eval under the display-only meta-terminal convention, and an eval result that produced an image under the same convention. Both were a call site hand-composing the `_meta.terminal_output` payload instead of going through the one function (`buildMetaTerminalOutput`) that knows to prepend the source header — now a nominally-branded type makes that literal a type error, and a new stream-level test guard (`EvalSourceDeliveryAuditor`) fails a whole frame sequence that never delivers a call's expected source on any rendered channel (oh-my-pi/oh-my-pi#7078 review 4823843361).
 
 ## [17.2.1] - 2026-07-30
 
