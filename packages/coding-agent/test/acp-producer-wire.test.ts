@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SessionNotification } from "@agentclientprotocol/sdk";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
@@ -108,6 +109,21 @@ function makeSpillingSession(): { session: ToolSession; artifactDir: string } {
  * final-defense inline cap — the common path, not the timeout/edge path.
  */
 const SPILLING_COMMAND = "seq 1 20000";
+
+/**
+ * 3000 fixed-width 64-byte lines (~192 KB), each carrying its own index so no
+ * two windows of the stream are byte-identical (self-similar filler would make
+ * the append-only probe below fire on legitimate deliveries). The width matters: bash streams
+ * through a `TailBuffer(DEFAULT_MAX_BYTES)` that trims to a line boundary, and
+ * 51,200 / 64 is exact, so the last streamed snapshot lands *exactly* on the
+ * 50 KB rollover floor every run instead of a line-width-dependent byte or two
+ * under it — the difference between reproducing
+ * oh-my-pi/oh-my-pi#7078 review 4824091334 and passing by luck. The final
+ * result is then `OutputSink`'s middle-elided head+tail summary, which starts
+ * with the run's original head (zero overlap with the streamed tail) and is
+ * longer than the watermark once its elision marker and notices are appended.
+ */
+const WIDE_LINE_COMMAND = `awk 'BEGIN{for(i=0;i<3000;i++) printf "%063d\\n", i}'`;
 
 async function runSpillingBash(): Promise<{
 	result: AgentToolResult<BashToolDetails>;
@@ -267,11 +283,27 @@ interface ProducerOutcome {
 	toolName: string;
 	args: Record<string, unknown>;
 	result: AgentToolResult<unknown>;
+	/**
+	 * Every partial result the producer pushed through `onUpdate`, in order.
+	 * Replaying these through the mapper before the final result is what makes
+	 * the delta/watermark machinery observable: a matrix that only feeds
+	 * `tool_execution_end` leaves `getMetaTerminalSent` empty, so every frame
+	 * takes the first-send path and no incremental state is ever exercised.
+	 */
+	updates: AgentToolResult<unknown>[];
 }
 
-/** The three rendering worlds a producer's result can land in. */
+/**
+ * The rendering worlds a producer's result can land in. `meta` is the
+ * display-only terminal convention for a client that understands
+ * `_meta.terminal_output` but hosts no real terminal (Zed during
+ * `session/load` replay, any bash/exec call with `pty: true`, every `eval`) —
+ * the only world where the incremental delta/watermark code runs, and the one
+ * the matrix originally had no mode for.
+ */
 const MODES = {
 	zed: { terminalMetaCapable: true, realTerminalCapable: true },
+	meta: { terminalMetaCapable: true, realTerminalCapable: false },
 	"real-terminal-only": { terminalMetaCapable: false, realTerminalCapable: true },
 	plain: { terminalMetaCapable: false, realTerminalCapable: false },
 } as const;
@@ -290,6 +322,15 @@ interface ProducerCase {
 	exitCode?: number;
 	/** The call created a client-owned terminal the frame must still reference. */
 	terminalId?: string;
+	/**
+	 * How many `[terminal output discontinuity]` notices the whole frame
+	 * sequence may carry. Declared per row from what the producer did: only a
+	 * run whose own tail buffer rolls between two `onUpdate` snapshots
+	 * genuinely loses bytes the mapper never saw, and only then may the mapper
+	 * say so. Default 0 — a claim of dropped bytes on a fully-replayed stream
+	 * is a fabrication.
+	 */
+	discontinuities?: number;
 	modes?: readonly ModeName[];
 }
 
@@ -323,13 +364,55 @@ async function runEval(toolCallId: string, backend: Record<string, unknown>): Pr
 	stubJsBackend(backend);
 	const args = { language: "js", code: "print('x')" } as const;
 	const tool = wrapToolWithMetaNotice(new EvalTool(makeEvalSession()));
-	return { toolName: "eval", args: { ...args }, result: await tool.execute(toolCallId, args) };
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "eval", args: { ...args }, result, updates };
+}
+
+/**
+ * A real `EvalTool.execute()` whose backend streams `chunks` through `onChunk`
+ * before returning, so the mapper sees a genuine multi-update sequence and the
+ * watermark/delta path is exercised the way a long-running cell exercises it.
+ * `total` bytes past eval's own `TailBuffer(DEFAULT_MAX_BYTES * 2)` window make
+ * its final result a re-rendered summary rather than a continuation.
+ */
+async function runStreamingEval(toolCallId: string, lines: number): Promise<ProducerOutcome> {
+	const chunks: string[] = [];
+	for (let i = 0; i < lines; i++) chunks.push(`${String(i).padStart(63, "0")}\n`);
+	const output = chunks.join("");
+	vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation((async (
+		_code: string,
+		options: { onChunk?: (chunk: string) => void },
+	) => {
+		for (const chunk of chunks) options.onChunk?.(chunk);
+		return {
+			output,
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			artifactId: undefined,
+			totalLines: lines,
+			totalBytes: output.length,
+			outputLines: lines,
+			outputBytes: output.length,
+			displayOutputs: [],
+		};
+	}) as never);
+	const args = { language: "js", code: "for (const l of lines) print(l)" } as const;
+	const tool = wrapToolWithMetaNotice(new EvalTool(makeEvalSession()));
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "eval", args: { ...args }, result, updates };
 }
 
 async function runBash(toolCallId: string, args: Record<string, unknown>): Promise<ProducerOutcome> {
 	const { session } = makeSpillingSession();
 	const tool = wrapToolWithMetaNotice(new BashTool(session));
-	return { toolName: "bash", args, result: await tool.execute(toolCallId, args as { command: string }) };
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args as { command: string }, undefined, update =>
+		updates.push(update),
+	);
+	return { toolName: "bash", args, result, updates };
 }
 
 /**
@@ -354,7 +437,9 @@ async function runTimingOutBridgeBash(toolCallId: string): Promise<ProducerOutco
 	(session as { getClientBridge: () => unknown }).getClientBridge = () => bridge;
 	const args = { command: "sleep 30", timeout: 1 };
 	const tool = wrapToolWithMetaNotice(new BashTool(session));
-	return { toolName: "bash", args, result: await tool.execute(toolCallId, args) };
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "bash", args, result, updates };
 }
 
 /**
@@ -362,7 +447,7 @@ async function runTimingOutBridgeBash(toolCallId: string): Promise<ProducerOutco
  * that only in `details.daemon.state`, which the TUI card reads and the ACP
  * mapper cannot — so the producer marks the result-level flag now.
  */
-async function runLaunch(toolCallId: string, op: "start" | "describe", state: string): Promise<ProducerOutcome> {
+async function runLaunch(op: "start" | "describe", state: string): Promise<ProducerOutcome> {
 	const projectDir = process.cwd();
 	const daemon = {
 		name: "web",
@@ -391,7 +476,7 @@ async function runLaunch(toolCallId: string, op: "start" | "describe", state: st
 	} as DaemonBrokerClient);
 	const args = op === "start" ? { op, name: "web", application: "bun", args: ["run", "dev"] } : { op, name: "web" };
 	const result = await executeLaunch({ cwd: projectDir } as ToolSession, args as never);
-	return { toolName: "hub", args, result };
+	return { toolName: "hub", args, result, updates: [] };
 }
 
 /** A real multi-file `apply_patch` where the second file does not exist. */
@@ -426,7 +511,9 @@ async function runPartiallyFailingEdit(toolCallId: string): Promise<ProducerOutc
 		].join("\n"),
 	};
 	const tool = wrapToolWithMetaNotice(new EditTool(session));
-	return { toolName: "edit", args, result: await tool.execute(toolCallId, args as never) };
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args as never, undefined, update => updates.push(update));
+	return { toolName: "edit", args, result, updates };
 }
 
 const PRODUCER_CASES: readonly ProducerCase[] = [
@@ -447,6 +534,23 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		run: id => runBash(id, { command: SPILLING_COMMAND }),
 		status: "completed",
 		exitCode: 0,
+		// ~110 KB through a 50 KB tail buffer: the bytes between the first
+		// snapshot and the second really are gone before the mapper sees them,
+		// so exactly one honest discontinuity notice is expected. Two means the
+		// final re-rendered summary was misread as a rollover as well.
+		discontinuities: 1,
+	},
+	{
+		name: "bash, middle-elided summary after a rolled tail window",
+		run: id => runBash(id, { command: WIDE_LINE_COMMAND }),
+		status: "completed",
+		exitCode: 0,
+		// The producer's own 50 KB window rolls between the two snapshots it
+		// emits for a 192 KB run, so one honest discontinuity is expected. The
+		// second one the mapper used to add — for the final elided summary,
+		// which is a re-render of what already streamed, not a continuation of
+		// it — came with a duplicate copy of the whole summary.
+		discontinuities: 1,
 	},
 	{
 		name: "bash, timeout with a live client terminal",
@@ -473,13 +577,22 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		status: "failed",
 	},
 	{
+		name: "eval, streamed past its own tail-buffer window",
+		run: id => runStreamingEval(id, 2500),
+		status: "completed",
+		exitCode: 0,
+		// 160 KB through eval's 100 KB window: the bytes in between are gone
+		// before the mapper can see them, so one honest discontinuity notice.
+		discontinuities: 1,
+	},
+	{
 		name: "hub start, daemon reported failed",
-		run: id => runLaunch(id, "start", "failed"),
+		run: () => runLaunch("start", "failed"),
 		status: "failed",
 	},
 	{
 		name: "hub describe of an already-failed daemon",
-		run: id => runLaunch(id, "describe", "failed"),
+		run: () => runLaunch("describe", "failed"),
 		status: "completed",
 	},
 	{
@@ -527,29 +640,98 @@ function frameTexts(update: Record<string, unknown>): string[] {
 	return texts;
 }
 
+/**
+ * Bytes a client would append to the display-only terminal, in delivery order.
+ * `AcpAgent` keeps the watermark per tool call across the whole sequence
+ * (`metaTerminalSent`), so the replay below has to as well or the incremental
+ * path is never entered.
+ */
+function replayThroughMapper(
+	toolCallId: string,
+	outcome: ProducerOutcome,
+	mode: (typeof MODES)[ModeName],
+): { frames: SessionNotification[]; terminalChunks: string[] } {
+	const watermarks = new Map<string, string>();
+	const options = {
+		...mode,
+		getToolArgs: () => outcome.args,
+		getMetaTerminalSent: (id: string) => watermarks.get(id),
+		setMetaTerminalSent: (id: string, value: string) => {
+			watermarks.set(id, value);
+		},
+	};
+	const frames: SessionNotification[] = [];
+	for (const partialResult of outcome.updates) {
+		frames.push(
+			...mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_update",
+					toolCallId,
+					toolName: outcome.toolName,
+					args: outcome.args,
+					partialResult,
+				} as AgentSessionEvent,
+				"session-1",
+				options,
+			),
+		);
+	}
+	const endFrames = mapAgentSessionEventToAcpSessionUpdates(
+		{
+			type: "tool_execution_end",
+			toolCallId,
+			toolName: outcome.toolName,
+			args: outcome.args,
+			isError: outcome.result.isError === true,
+			result: outcome.result,
+		} as AgentSessionEvent,
+		"session-1",
+		options,
+	);
+	frames.push(...endFrames);
+	const terminalChunks: string[] = [];
+	for (const frame of frames) {
+		const meta = (frame.update as { _meta?: { terminal_output?: { data?: unknown } } })._meta;
+		if (typeof meta?.terminal_output?.data === "string") terminalChunks.push(meta.terminal_output.data);
+	}
+	return { frames: endFrames, terminalChunks };
+}
+
+const DISCONTINUITY_MARKER = "terminal output discontinuity";
+
+/**
+ * A terminal buffer is append-only: a client concatenates every
+ * `terminal_output.data` it receives. Re-sending a body it already holds
+ * duplicates what the user sees, so no chunk may repeat a substantial run of
+ * already-delivered bytes. The 256-byte probe skips notice-sized chunks (whose
+ * repetition is bounded and legible) while catching a re-sent output body.
+ */
+function expectAppendOnly(chunks: readonly string[]): void {
+	let delivered = "";
+	for (const chunk of chunks) {
+		const body = chunk.replaceAll(/\n?\[[^\]]*terminal output discontinuity[^\]]*\]\n?/g, "");
+		if (body.length >= 256) {
+			expect(delivered.includes(body.slice(0, 256))).toBe(false);
+		}
+		delivered += chunk;
+	}
+}
+
 describe("ACP producer matrix", () => {
 	for (const producerCase of PRODUCER_CASES) {
-		for (const modeName of producerCase.modes ?? (["zed", "plain"] as const)) {
+		for (const modeName of producerCase.modes ?? (["zed", "meta", "plain"] as const)) {
 			it(`${producerCase.name} → ${modeName}`, async () => {
 				const toolCallId = `matrix-${producerCase.name.replace(/[^a-z0-9]+/gi, "-")}-${modeName}`;
-				const { toolName, args, result } = await producerCase.run(toolCallId);
-				const event = {
-					type: "tool_execution_end",
-					toolCallId,
-					toolName,
-					args,
-					isError: result.isError === true,
-					result,
-				} as AgentSessionEvent;
-				const options = MODES[modeName];
-				const updates = mapAgentSessionEventToAcpSessionUpdates(event, "session-1", options);
-				expect(updates).toHaveLength(1);
-				const update = updates[0]!.update as unknown as Record<string, unknown>;
+				const outcome = await producerCase.run(toolCallId);
+				const mode = MODES[modeName];
+				const { frames, terminalChunks } = replayThroughMapper(toolCallId, outcome, mode);
+				expect(frames).toHaveLength(1);
+				const update = frames[0]!.update as unknown as Record<string, unknown>;
 
 				// 1. Declared outcome.
 				expect(update.status).toBe(producerCase.status);
 				const exit = (update._meta as { terminal_exit?: { exit_code?: number } } | undefined)?.terminal_exit;
-				if (modeName === "zed" && exit) {
+				if (exit) {
 					expect(exit.exit_code).toBe(producerCase.exitCode);
 				}
 				if (producerCase.terminalId) {
@@ -560,15 +742,23 @@ describe("ACP producer matrix", () => {
 				}
 
 				// 2. No structurally-recorded producer fact silently dropped.
-				const texts = frameTexts(update).join("\n");
-				for (const fact of producerFacts(result)) {
+				const texts = [...frameTexts(update), ...terminalChunks].join("\n");
+				for (const fact of producerFacts(outcome.result)) {
 					expect(texts).toContain(fact);
 				}
 
-				// 3. Wire invariants, same check `AcpAgent#sendUpdate` runs.
-				expect(checkAcpUpdateInvariants(updates[0]!, { terminalMetaCapable: options.terminalMetaCapable })).toEqual(
-					[],
-				);
+				// 3. Append-only terminal stream: nothing delivered twice.
+				expectAppendOnly(terminalChunks);
+
+				// 4. No fabricated data loss. The replay feeds the mapper every
+				// snapshot the producer emitted, so it may only claim dropped
+				// bytes when the producer's own tail buffer rolled between two of
+				// them — declared per row, never inferred from the frames.
+				const claimed = terminalChunks.filter(chunk => chunk.includes(DISCONTINUITY_MARKER)).length;
+				expect(claimed).toBeLessThanOrEqual(producerCase.discontinuities ?? 0);
+
+				// 5. Wire invariants, same check `AcpAgent#sendUpdate` runs.
+				expect(checkAcpUpdateInvariants(frames[0]!, { terminalMetaCapable: mode.terminalMetaCapable })).toEqual([]);
 			});
 		}
 	}
