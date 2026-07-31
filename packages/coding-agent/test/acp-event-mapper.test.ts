@@ -1827,6 +1827,104 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("reports a failing eval cell's own exit code and a failed status", () => {
+		// `eval` never calls `.error()` on its result builder, so the event's
+		// `isError` is false even for a cell that exited nonzero — the failure
+		// lives in `details.isError` and the cell's own `exitCode`. Reading only
+		// the event flag reported `exit_code: 0` and `status: "completed"` for a
+		// terminal whose body says the command failed
+		// (oh-my-pi/oh-my-pi#7078 review 4823986869).
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-failed",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "boom\n\nCommand exited with code 1" }],
+					details: {
+						isError: true,
+						cells: [{ index: 0, code: "process.exit(1)", output: "boom", status: "error", exitCode: 1 }],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "js", code: "process.exit(1)" }) },
+		);
+		const end = endUpdates[0]!.update as { status?: string; _meta?: Record<string, unknown> };
+		expect(end.status).toBe("failed");
+		expect(end._meta).toEqual({
+			terminal_output: {
+				terminal_id: "tc-eval-failed",
+				data: `process.exit(1)\n${"─".repeat(48)}\nboom\n\nCommand exited with code 1`,
+			},
+			terminal_exit: { terminal_id: "tc-eval-failed", exit_code: 1, signal: null },
+		});
+	});
+
+	it("takes the first failing cell's exit code in a multi-cell eval", () => {
+		// Execution stops at the first cell that fails, so that cell's code is
+		// the call's exit status — a later cell's absent/zero code must not
+		// mask it.
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-failed-multi",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "ok\n\nCommand exited with code 3" }],
+					details: {
+						isError: true,
+						cells: [
+							{ index: 0, code: "print(1)", output: "ok", status: "complete", exitCode: 0 },
+							{ index: 1, code: "raise SystemExit(3)", output: "", status: "error", exitCode: 3 },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "print(1)" }) },
+		);
+		const end = endUpdates[0]!.update as { status?: string; _meta?: Record<string, unknown> };
+		expect(end.status).toBe("failed");
+		const meta = end._meta as { terminal_exit?: { exit_code?: number } };
+		expect(meta.terminal_exit?.exit_code).toBe(3);
+	});
+
+	it("leaves a failed eval's exit status blank when no exit code exists anywhere", () => {
+		// An aborted eval marks `details.isError` but has no exit code in any
+		// cell (`eval.ts`'s cancelled branch clears it). A wrong code is worse
+		// than none, so the terminal's exit status stays unset while the card
+		// still reports the failure.
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-aborted",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Command aborted" }],
+					details: {
+						isError: true,
+						cells: [{ index: 0, code: "sleep(30)", output: "", status: "error" }],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "py", code: "sleep(30)" }) },
+		);
+		const end = endUpdates[0]!.update as { status?: string; _meta?: Record<string, unknown> };
+		expect(end.status).toBe("failed");
+		expect(end._meta).toEqual({
+			terminal_output: {
+				terminal_id: "tc-eval-aborted",
+				data: `sleep(30)\n${"─".repeat(48)}\nCommand aborted`,
+			},
+			terminal_exit: { terminal_id: "tc-eval-aborted", signal: null },
+		});
+	});
+
 	it("routes eval images through a plain content card instead of the terminal-only one", () => {
 		// Regression test, round 3 of the same finding: Zed's `has_terminals`
 		// drops *every* sibling `content` item once a `terminal` item exists —
