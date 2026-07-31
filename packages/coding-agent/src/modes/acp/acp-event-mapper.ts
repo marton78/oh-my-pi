@@ -1101,11 +1101,21 @@ function buildMetaTerminalDelta(
  * finds a real suffix/prefix boundary, or when the streamed watermark is
  * already large enough that the producer's own bounded tail buffer could
  * plausibly have rolled forward (50 KB bash / 100 KB eval, `DEFAULT_MAX_BYTES`)
- * — below that floor no tool's tail buffer can have dropped anything yet, so
- * zero overlap on a short watermark can only be synthesis, not loss.
- * Otherwise falls through to `buildMetaTerminalDelta`'s overlap/rollover
- * handling, which still runs its own (fuzz-tested) resync check for a
- * plausible mid-stream roll.
+ * *and* the producer didn't say it re-rendered its final body. That last
+ * condition is not redundant: past the floor, a middle-elided summary
+ * (`OutputSink`'s head+tail retention) starts with the run's *original head*
+ * while the watermark holds its *tail*, so overlap is legitimately zero while
+ * the elision marker and appended notices push it past the watermark's length
+ * — the floor alone then classified a pure re-render as a rollover and
+ * fabricated a discontinuity notice plus a second copy of the whole summary
+ * (oh-my-pi/oh-my-pi#7078 review 4824091334: a `seq 1 20000` run delivered
+ * 127 KB for a 51 KB body, with the head shown twice). `isDisplayReRendered`
+ * reads the producer's own `details.meta` markers, so it is a positive signal
+ * where the length invariant above is a structural one — neither subsumes the
+ * other: markers catch a re-render that grew, length catches one no marker
+ * describes. Otherwise falls through to `buildMetaTerminalDelta`'s
+ * overlap/rollover handling, which still runs its own (fuzz-tested) resync
+ * check for a plausible mid-stream roll.
  *
  * Genuinely new facts (wall time, an `artifact://` recovery pointer, a real
  * truncation warning, `eval`'s backend-fallback `details.notice`) always ride
@@ -1138,7 +1148,8 @@ function buildFinalMetaTerminalDelta(
 	if (cumulativeOutput.length > prior.length) {
 		const rolloverFloorBytes = toolName === "eval" ? DEFAULT_MAX_BYTES * 2 : DEFAULT_MAX_BYTES;
 		const isPlausibleContinuation =
-			prior.length >= rolloverFloorBytes || deliveredOverlap(prior, cumulativeOutput) > 0;
+			deliveredOverlap(prior, cumulativeOutput) > 0 ||
+			(prior.length >= rolloverFloorBytes && !isDisplayReRendered(result));
 		if (isPlausibleContinuation) {
 			return buildMetaTerminalDelta(toolCallId, toolName, args, withNotices, options);
 		}
@@ -1148,6 +1159,23 @@ function buildFinalMetaTerminalDelta(
 	// synthesized facts are left to send — they are never part of the process
 	// byte stream, so they cannot already have been delivered.
 	return notices ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${notices}\n`, options) : undefined;
+}
+
+/**
+ * Whether the producer says this result's body is a re-render of what already
+ * streamed rather than more of it: head/tail elision or column truncation both
+ * rewrite already-delivered lines (`OutputSink`, `wrapToolWithMetaNotice`).
+ *
+ * A positive marker signal, complementing `buildFinalMetaTerminalDelta`'s
+ * structural length invariant — a re-render that *grew* (elision marker plus
+ * appended notices on a snapshot past the producer's own buffer window) has no
+ * length signal to catch it, and its zero overlap is legitimate rather than
+ * evidence of a rollover.
+ */
+function isDisplayReRendered(result: unknown): boolean {
+	const meta = asEditDetails(result)?.meta;
+	if (!meta) return false;
+	return meta.truncation !== undefined || meta.limits?.columnTruncated !== undefined;
 }
 
 /** `notices` lines absent from `text`, joined; `""` when it already has them all. */
