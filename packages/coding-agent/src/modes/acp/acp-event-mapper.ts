@@ -453,7 +453,11 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 						? [...diffContent, textToolCallContent(codeFence ? fenceCodeBlock(combinedText) : combinedText)]
 						: diffContent;
 				} else {
-					resultContent = [...diffContent, ...extractToolCallContent(event.result, options, codeFence)];
+					resultContent = recoverTruncatedNoticeContent(
+						[...diffContent, ...extractToolCallContent(event.result, options, codeFence)],
+						event.result,
+						codeFence,
+					);
 				}
 				const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 				if (content.length > 0) {
@@ -1104,10 +1108,13 @@ function buildMetaTerminalDelta(
  * plausible mid-stream roll.
  *
  * Genuinely new facts (wall time, an `artifact://` recovery pointer, a real
- * truncation warning) always ride through via `extractTerminalNotices`
- * (`details.notices` plus the same-source truncation notice a spilled
- * `details.meta` carries), same as `buildLiveTerminalNoticeMeta`, regardless
- * of which branch below fires.
+ * truncation warning, `eval`'s backend-fallback `details.notice`) always ride
+ * through via `extractTerminalNotices` (`details.notices`/`notice` plus the
+ * same-source truncation notice a spilled `details.meta` carries), same as
+ * `buildLiveTerminalNoticeMeta`, regardless of which branch below fires: the
+ * re-render branch sends them on their own, and the two continuation branches
+ * append whichever lines the body doesn't already carry itself (bash puts its
+ * notices inline in the final text, `eval` keeps `details.notice` out of it).
  */
 function buildFinalMetaTerminalDelta(
 	toolCallId: string,
@@ -1118,20 +1125,38 @@ function buildFinalMetaTerminalDelta(
 	options: AcpEventMapperOptions,
 ): MetaTerminalOutput | undefined {
 	const prior = options.getMetaTerminalSent?.(toolCallId);
+	const notices = extractTerminalNotices(result);
+	// Continuation branches send the body, so only notice lines the body itself
+	// lacks are appended. The re-render/shrink decision below compares the raw
+	// snapshot, never this augmented one — appended notice bytes must not turn
+	// a re-render into an apparent growth.
+	const missingNotices = missingNoticeLines(cumulativeOutput, notices);
+	const withNotices = missingNotices ? `${cumulativeOutput}\n\n${missingNotices}` : cumulativeOutput;
 	if (prior === undefined) {
-		return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
+		return buildMetaTerminalDelta(toolCallId, toolName, args, withNotices, options);
 	}
 	if (cumulativeOutput.length > prior.length) {
 		const rolloverFloorBytes = toolName === "eval" ? DEFAULT_MAX_BYTES * 2 : DEFAULT_MAX_BYTES;
 		const isPlausibleContinuation =
 			prior.length >= rolloverFloorBytes || deliveredOverlap(prior, cumulativeOutput) > 0;
 		if (isPlausibleContinuation) {
-			return buildMetaTerminalDelta(toolCallId, toolName, args, cumulativeOutput, options);
+			return buildMetaTerminalDelta(toolCallId, toolName, args, withNotices, options);
 		}
 	}
 	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
-	const notices = extractTerminalNotices(result);
+	// A re-render replaces nothing the user already watched stream, so only the
+	// synthesized facts are left to send — they are never part of the process
+	// byte stream, so they cannot already have been delivered.
 	return notices ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${notices}\n`, options) : undefined;
+}
+
+/** `notices` lines absent from `text`, joined; `""` when it already has them all. */
+function missingNoticeLines(text: string, notices: string | undefined): string {
+	if (!notices) return "";
+	return notices
+		.split("\n")
+		.filter(line => line.trim().length > 0 && !text.includes(line.trim()))
+		.join("\n");
 }
 
 /**
@@ -1909,16 +1934,23 @@ function hasTerminalContent(content: ToolCallContent[], terminalId: string): boo
 /**
  * `details.notices`: notes a tool appended after its raw output (exit code,
  * wall time, truncation marker, `[raw output: artifact://N]` pointer). Only
- * `bash`/`shell`/`exec` populate this. The caller decides how to deliver it —
- * for a real live terminal, see `buildLiveTerminalNoticeMeta`.
+ * `bash`/`shell`/`exec` populate this. `eval` has its own singular
+ * `details.notice` for a backend-fallback explanation, which its TUI card
+ * renders as a dim bracketed line (`eval-render.ts`) — read both, or the same
+ * class of loss as every other terminal-path notice applies to whichever one
+ * this doesn't know about. The caller decides how to deliver it — for a real
+ * live terminal, see `buildLiveTerminalNoticeMeta`.
  */
 function extractDetailsNotices(value: unknown): string | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
 	const details = (value as DetailsContainer).details;
 	if (typeof details !== "object" || details === null) return undefined;
 	const notices = (details as NoticesContainer).notices;
-	if (!Array.isArray(notices)) return undefined;
-	const lines = notices.filter((notice): notice is string => typeof notice === "string" && notice.length > 0);
+	const lines = Array.isArray(notices)
+		? notices.filter((notice): notice is string => typeof notice === "string" && notice.length > 0)
+		: [];
+	const single = (details as { notice?: unknown }).notice;
+	if (typeof single === "string" && single.length > 0 && !lines.includes(single)) lines.push(single);
 	return lines.length > 0 ? normalizeText(lines.join("\n")) : undefined;
 }
 
@@ -1956,6 +1988,42 @@ function extractTerminalNotices(value: unknown): string | undefined {
 	const metaArtifactIds = [...metaNotice.matchAll(/artifact:\/\/(\w+)/g)].map(m => m[1]);
 	if (metaArtifactIds.length > 0 && metaArtifactIds.every(id => noticeArtifactIds.has(id))) return notices;
 	return notices ? `${notices}\n\n${metaNotice}` : metaNotice;
+}
+
+/**
+ * Re-attach any notice line the plain-content path dropped.
+ *
+ * A producer appends its notices *after* its output (`bash.ts`'s
+ * `#buildCompletedResult`, `wrapToolWithMetaNotice`'s `formatOutputNotice`
+ * footer), so they sit at the very end of the tool's text — exactly the part
+ * `ACP_TEXT_LIMIT`'s head truncation throws away. For any output past ~4 KB a
+ * client with no terminal channel therefore got a silently clipped dump with
+ * no truncation notice and no `artifact://<id>` recovery pointer: the same
+ * loss the terminal paths already re-derive structurally
+ * (`extractTerminalNotices`), on the one path that had no such recovery.
+ *
+ * Only lines missing from the emitted text are appended, so the common
+ * untruncated case (where the producer's own footer survived) adds nothing
+ * rather than restating it. Terminal-bearing content is left alone: those
+ * paths deliver notices through `_meta.terminal_output` on the terminal's own
+ * id, and a sibling text item next to a terminal item is dropped by Zed's
+ * `has_terminals` renderer anyway (see `extractStructuredToolCallContent`).
+ */
+function recoverTruncatedNoticeContent(
+	content: ToolCallContent[],
+	result: unknown,
+	codeFence: boolean,
+): ToolCallContent[] {
+	if (content.some(item => item.type === "terminal")) return content;
+	const notices = extractTerminalNotices(result);
+	if (!notices) return content;
+	const emitted = content
+		.filter(item => item.type === "content" && item.content.type === "text")
+		.map(item => (item.type === "content" && item.content.type === "text" ? item.content.text : ""))
+		.join("\n");
+	const missing = missingNoticeLines(emitted, notices);
+	if (!missing) return content;
+	return [...content, textToolCallContent(codeFence ? fenceCodeBlock(missing) : missing)];
 }
 
 /**

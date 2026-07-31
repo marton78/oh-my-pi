@@ -1925,6 +1925,63 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("delivers eval's singular backend-fallback notice to the terminal channel", () => {
+		// `eval` records a backend-fallback explanation in `details.notice`
+		// (singular), not bash's `details.notices` array — its TUI card renders
+		// it as a dim bracketed line, while the ACP terminal path read only the
+		// plural field and dropped it.
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-eval-notice",
+				toolName: "eval",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "ok" }],
+					details: { notice: "python unavailable; ran on the js backend instead" },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, getToolArgs: () => ({ language: "js", code: "print(1)" }) },
+		);
+		const meta = endUpdates[0]!.update._meta as { terminal_output?: { data: string } };
+		expect(meta.terminal_output?.data).toContain("python unavailable; ran on the js backend instead");
+	});
+
+	it("re-attaches a truncation notice the text limit cut off the end of plain content", () => {
+		// Producers append their notices *after* the output, so
+		// `ACP_TEXT_LIMIT`'s head truncation drops them — leaving a client with
+		// no terminal channel a silently clipped dump with no recovery pointer.
+		const notice = "[Showing 1 of 9000 lines. Read artifact://7 for full output]";
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-truncated-notice",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: `${"x".repeat(6000)}\n\n${notice}` }],
+					details: { notices: [notice] },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ getToolArgs: () => ({ command: "seq 1 9000" }) },
+		);
+		const update = endUpdates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		const content = update.content ?? [];
+		const texts = content
+			.filter(item => item.type === "content" && item.content?.type === "text")
+			.map(item => item.content?.text ?? "");
+		// The clipped body no longer carries the notice…
+		expect(texts[0]).not.toContain("artifact://7");
+		// …so it rides as its own block instead of being lost.
+		expect(texts.join("\n")).toContain("artifact://7");
+		// And it is not restated when the body still carries it.
+		expect(texts.join("\n").match(/artifact:\/\/7/g)).toHaveLength(1);
+	});
+
 	it("routes eval images through a plain content card instead of the terminal-only one", () => {
 		// Regression test, round 3 of the same finding: Zed's `has_terminals`
 		// drops *every* sibling `content` item once a `terminal` item exists —
