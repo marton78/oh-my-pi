@@ -2653,7 +2653,12 @@ describe("ACP event mapper", () => {
 			options,
 		);
 		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		// No discontinuity and no re-send of the whitespace — but `(no output)`
+		// itself never streamed, so `undeliveredBodyLines` delivers that one
+		// line. Without it the terminal shows four spaces and stops, and the
+		// substitution the producer made to explain the empty run is invisible.
 		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-whitespace-only", data: "\n(no output)\n" },
 			terminal_exit: { terminal_id: "tc-whitespace-only", exit_code: 0, signal: null },
 		});
 	});
@@ -2695,7 +2700,12 @@ describe("ACP event mapper", () => {
 			options,
 		);
 		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		// The already-streamed "hello" is not re-sent, but the synthesized
+		// exit-code suffix is a fact this fixture declares nowhere structurally
+		// (no `details.notices`), so the body reconciliation is the only thing
+		// that gets it to a terminal-rendering client.
 		expect(end._meta).toEqual({
+			terminal_output: { terminal_id: "tc-trailing-newlines", data: "\nCommand exited with code 1\n" },
 			terminal_exit: { terminal_id: "tc-trailing-newlines", signal: null },
 		});
 	});
@@ -2804,13 +2814,109 @@ describe("ACP event mapper", () => {
 			options,
 		);
 		const end = endUpdates[0]!.update as { _meta?: Record<string, unknown> };
+		// The elided body is not re-diffed, but its elision marker is a line the
+		// client never received (the head/tail lines around it did stream), so
+		// the body reconciliation delivers exactly that one line ahead of the
+		// notices — the marker is the only in-band statement of *where* the gap
+		// is. Everything else stays suppressed: 200 already-streamed `hello`
+		// lines are recognised as delivered rather than re-sent.
 		expect(end._meta).toEqual({
 			terminal_output: {
 				terminal_id: "tc-elided",
-				data: "\n(output truncated)\n[raw output: artifact://7]\n",
+				data: "\n… [elided] …\n\n(output truncated)\n[raw output: artifact://7]\n",
 			},
 			terminal_exit: { terminal_id: "tc-elided", exit_code: 0, signal: null },
 		});
+	});
+
+	it("delivers a re-rendered final body's line that the producer declared nowhere structurally", () => {
+		// The class every round of this review kept re-finding one instance of:
+		// a producer bakes a fact into its own text (here an `OutputSink.dump`
+		// timeout annotation, prefixed onto the body and never streamed through
+		// `onChunk`) and declares it in no structural field. `details` is empty
+		// on purpose — a check that compares the frame against declared facts is
+		// vacuous by construction here, which is exactly why the reconciliation
+		// reads the authoritative body instead.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-undeclared-annotation",
+				toolName: "bash",
+				args: { command: "sleep 30" },
+				partialResult: { content: [{ type: "text", text: "working\n" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-undeclared-annotation",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "[Command timed out after 2 seconds]\nworking\n" }],
+					details: {},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
+		expect(end._meta?.terminal_output?.data).toBe("\n[Command timed out after 2 seconds]\n");
+	});
+
+	it("leaves a wholesale body divergence to the existing re-render classification", () => {
+		// The other half of the cap's contract: past a handful of lines the
+		// difference is not an annotation but a body that diverged wholesale
+		// (an elided summary whose head the producer dropped, a rolled
+		// watermark). Re-delivering that is the duplicate-send bug of review
+		// 4824091334 — a client concatenates whatever arrives — so the
+		// reconciliation reports nothing and the frame carries facts alone.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		mapUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-wholesale-divergence",
+				toolName: "bash",
+				args: { command: "printf 'streamed\\n'" },
+				partialResult: { content: [{ type: "text", text: "streamed\n" }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const replaced = Array.from({ length: 40 }, (_, i) => `replacement line ${i}`).join("\n");
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-wholesale-divergence",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: replaced }],
+					details: { notices: ["Wall time: 0.02 seconds"] },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
+		expect(end._meta?.terminal_output?.data).toBe("\nWall time: 0.02 seconds\n");
 	});
 
 	it("fuzz: deliveredOverlap matches a brute-force reference across randomized byte strings", () => {

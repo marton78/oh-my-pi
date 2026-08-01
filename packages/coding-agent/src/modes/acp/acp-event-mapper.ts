@@ -1144,6 +1144,10 @@ function buildMetaTerminalDelta(
  * re-render branch sends them on their own, and the two continuation branches
  * append whichever lines the body doesn't already carry itself (bash puts its
  * notices inline in the final text, `eval` keeps `details.notice` out of it).
+ * The re-render branch additionally reconciles against the authoritative body
+ * (`undeliveredBodyLines`), which needs no structural declaration at all — the
+ * backstop for a producer that bakes a fact into its text and declares
+ * nothing.
  */
 function buildFinalMetaTerminalDelta(
 	toolCallId: string,
@@ -1174,11 +1178,87 @@ function buildFinalMetaTerminalDelta(
 		}
 	}
 	options.setMetaTerminalSent?.(toolCallId, cumulativeOutput);
-	// A re-render replaces nothing the user already watched stream, so only the
-	// synthesized facts are left to send — they are never part of the process
-	// byte stream, so they cannot already have been delivered.
-	return facts ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${facts}\n`, options) : undefined;
+	// A re-render replaces nothing the user already watched stream, so the body
+	// itself is deliberately not re-sent. What must still go out is anything the
+	// client has never seen on this terminal: the synthesized facts (never part
+	// of the process byte stream) plus — the safety net — any line of the
+	// producer's own authoritative body that never reached it.
+	//
+	// That second half is what makes this path robust to a producer that
+	// composes a fact straight into its text without declaring it structurally.
+	// Every guard in `docs/acp-development.md` catches bytes a frame shouldn't
+	// contain; none could catch a fact nobody declared, because there was
+	// nothing to compare against. Reconciling against the body — the same text
+	// a plain-content client renders verbatim — needs no declaration to exist.
+	const undelivered = undeliveredBodyLines(cumulativeOutput, prior);
+	// Facts keep their own spacing and come last (they are trailers: wall time,
+	// exit code, a recovery pointer). A reconciled line that a fact already
+	// states is dropped rather than restated in a second wording.
+	const bodyOnly = facts
+		? undelivered
+				.split("\n")
+				.filter(line => line.length > 0 && !facts.includes(line))
+				.join("\n")
+		: undelivered;
+	const payload = [bodyOnly, facts].filter((part): part is string => !!part).join("\n\n");
+	return payload ? buildMetaTerminalOutput(toolCallId, toolName, args, `\n${payload}\n`, options) : undefined;
 }
+
+/**
+ * Lines of a re-rendered final body that never reached the client, or `""`
+ * when there are more of them than a synthesized annotation could plausibly
+ * account for.
+ *
+ * The cap is the whole design. A handful of undelivered lines is a producer
+ * baking a note into its text — a `dump(notice)` timeout/kill/stdin
+ * annotation, a synthesized exit-code suffix — and re-delivering it costs one
+ * line and closes the omission class for producers not yet written. Hundreds
+ * of them mean the body diverged wholesale: a middle-elided summary whose head
+ * the producer's own tail window dropped long before the mapper saw it, or a
+ * watermark that rolled past `MAX_WATERMARK_BYTES`. Re-sending *that* is the
+ * duplicate-delivery bug this PR already fixed once (a 51 KB body shown twice,
+ * oh-my-pi/oh-my-pi#7078 review 4824091334) — the terminal is append-only, so
+ * a client concatenates whatever arrives. Above the cap this reports nothing
+ * and leaves the existing classification alone; the loss there is already
+ * acknowledged by the producer's own elision notice, which rides in `facts`.
+ */
+function undeliveredBodyLines(finalBody: string, delivered: string): string {
+	const deliveredLines = new Set(delivered.split("\n"));
+	const missing: string[] = [];
+	let bytes = 0;
+	for (const rawLine of finalBody.split("\n")) {
+		const line = rawLine.trim();
+		if (line.length === 0 || deliveredLines.has(line) || delivered.includes(line)) continue;
+		// A line whose head already reached the client is a re-render of it, not
+		// a new fact: per-line column truncation (`tools.maxColumn`) rewrites the
+		// tail of an already-streamed line, and re-delivering the shortened copy
+		// would show it twice. Matching on the head keeps this structural instead
+		// of enumerating every normalization a producer might apply.
+		const head = line.slice(0, RECONCILE_LINE_HEAD_CHARS);
+		if (head.length >= RECONCILE_LINE_HEAD_CHARS && delivered.includes(head)) continue;
+		missing.push(line);
+		bytes += line.length + 1;
+		if (missing.length > MAX_RECONCILED_BODY_LINES || bytes > MAX_RECONCILED_BODY_BYTES) return "";
+	}
+	return missing.join("\n");
+}
+
+/**
+ * How much re-rendered body `undeliveredBodyLines` may re-deliver before it
+ * classifies the difference as a wholesale divergence rather than a
+ * synthesized annotation. Sized for the largest real annotation block observed
+ * (a kernel timeout note plus a wall-time/exit-code trailer), well under any
+ * elided summary or rolled window.
+ */
+const MAX_RECONCILED_BODY_LINES = 8;
+const MAX_RECONCILED_BODY_BYTES = 2_000;
+
+/**
+ * Head length that identifies a body line as one already delivered in a
+ * different rendering. Long enough that two genuinely distinct notices don't
+ * collide, short enough to survive a per-line column cap.
+ */
+const RECONCILE_LINE_HEAD_CHARS = 40;
 
 /**
  * Whether the producer says this result's body is a re-render of what already
