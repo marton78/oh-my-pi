@@ -59,6 +59,8 @@
 ### Fixed
 
 - ACP fixes:
+	- Fixed a `bash`/`shell`/`exec` timeout showing partial output and no reason for stopping in an ACP terminal card: the timeout annotation was composed into the result text and never recorded as a structured fact, which is the only channel a terminal card reads.
+	- ACP terminal cards now recover any line of a tool's own final output that reached no rendered channel, so a fact a tool writes into its text without declaring it structurally no longer disappears.
 	- Fixed ACP `eval`'s kernel-timeout and stdin-requested notices reaching only the model-facing text instead of the terminal card.
 	- Fixed an ACP `eval` call's source code disappearing from the rendered card when replaying an interrupted eval via `session/load`, or when the eval produced an image.
 	- Fixed a failing `eval` reporting a successful ACP status and a synthesized exit code 0, even though its terminal output showed a nonzero exit.
