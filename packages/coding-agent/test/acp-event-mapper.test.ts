@@ -761,6 +761,35 @@ describe("ACP event mapper", () => {
 		);
 	});
 
+	it("preserves file attribution when diagnostics text is identical", () => {
+		const meta = { diagnostics: { summary: "1 warning", messages: ["unused import"] } };
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-duplicate-diagnostics",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Updated a.ts\nUpdated b.ts" }],
+					details: {
+						perFileResults: [
+							{ path: "a.ts", oldText: "before-a", newText: "after-a", meta },
+							{ path: "b.ts", oldText: "before-b", newText: "after-b", meta },
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		const update = updates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		const notice = update.content?.find(block => block.type === "content")?.content?.text;
+		expect(notice).toContain(`a.ts: ${formatOutputNotice(meta).trim()}`);
+		expect(notice).toContain(`b.ts: ${formatOutputNotice(meta).trim()}`);
+	});
+
 	it("preserves LSP diagnostics alongside a partially-failed edit's per-file failure text", () => {
 		// Same discard, mirrored for the error branch: `extractEditFailureText`
 		// reads only `perFileResults`, so a diagnostics notice attached to the

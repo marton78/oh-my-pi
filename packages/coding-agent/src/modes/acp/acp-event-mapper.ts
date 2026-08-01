@@ -1772,9 +1772,10 @@ function extractOutputNoticeText(result: unknown): string | undefined {
 	const seen = new Set<string>();
 	const pushNotice = (meta: OutputMeta | undefined, path: string | undefined) => {
 		const notice = formatOutputNotice(meta).trim();
-		if (!notice || seen.has(notice)) return;
-		seen.add(notice);
-		notices.push(path ? `${path}: ${notice}` : notice);
+		const attributedNotice = path ? `${path}: ${notice}` : notice;
+		if (!notice || seen.has(attributedNotice)) return;
+		seen.add(attributedNotice);
+		notices.push(attributedNotice);
 	};
 	pushNotice(details.meta, undefined);
 	for (const entry of details.perFileResults ?? []) {
