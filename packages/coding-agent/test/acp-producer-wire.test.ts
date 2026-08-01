@@ -12,7 +12,10 @@ import type { EvalToolDetails } from "@oh-my-pi/pi-coding-agent/eval/types";
 import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
 import * as daemonClient from "@oh-my-pi/pi-coding-agent/launch/client";
 import type { DaemonRpcResult } from "@oh-my-pi/pi-coding-agent/launch/protocol";
-import { mapAgentSessionEventToAcpSessionUpdates } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
+import {
+	mapAgentSessionEventToAcpSessionUpdates,
+	wantsMetaTerminal,
+} from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
 import { checkAcpUpdateInvariants } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-update-invariants";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -321,25 +324,77 @@ interface ProducerCase {
 	/** The call created a client-owned terminal the frame must still reference. */
 	terminalId?: string;
 	/**
-	 * How many `[terminal output discontinuity]` notices the whole frame
-	 * sequence may carry. Declared per row from what the producer did: only a
-	 * run whose own tail buffer rolls between two `onUpdate` snapshots
-	 * genuinely loses bytes the mapper never saw, and only then may the mapper
-	 * say so. Default 0 — a claim of dropped bytes on a fully-replayed stream
-	 * is a fabrication.
+	 * How many times the producer's own tail buffer genuinely rolled between
+	 * two `onUpdate` snapshots, losing bytes before the mapper ever saw them.
+	 * Default 0 — a claim of dropped bytes on a fully-replayed stream is a
+	 * fabrication.
+	 *
+	 * This describes the *producer*, so it is one number for the row. How many
+	 * `[terminal output discontinuity]` notices may then appear on the wire is
+	 * derived from the mode, not declared: only a display-only meta terminal
+	 * has a mapper-owned buffer to lose its place in, so every other mode must
+	 * carry exactly zero. Asserted for equality, not as a ceiling — an
+	 * allowance that stops being needed is one that will hide the next
+	 * regression, and an exact number is what caught this matrix's own stale
+	 * `discontinuities: 1` on a row that never rolled at all.
+	 *
+	 * `{ upTo, because }` is the one escape hatch, for a stream whose snapshot
+	 * boundaries the test genuinely cannot pin (pipe read sizes decide whether
+	 * a single delta exceeds the producer's window). It must say so out loud;
+	 * a row that can be made deterministic must be, not described as if it
+	 * couldn't.
 	 */
-	discontinuities?: number;
+	discontinuities?: number | { upTo: number; because: string };
+	/**
+	 * Why this producer's own buffering destroys part of its final body before
+	 * the mapper ever receives it — a middle-elided summary, a rolled tail
+	 * window. Check #6 cannot apply to such a row in any mode: no rendered
+	 * channel can deliver bytes nobody handed to the mapper, and the loss is
+	 * already acknowledged by the producer's own elision notice (check #2) and
+	 * bounded by check #4.
+	 *
+	 * Separate from `discontinuities`, which counts what the *wire* may claim.
+	 * They came apart the moment the wire budget became mode-derived: a row
+	 * whose producer really did drop bytes still carries zero claims in a mode
+	 * with no mapper-owned buffer, and folding the two together silently
+	 * un-exempted exactly those cells.
+	 */
+	producerDroppedBytes?: string;
+	/**
+	 * Substrings the *producer* must have recorded structurally, asserted
+	 * against `producerFacts(result)` before the mapper runs at all.
+	 *
+	 * Check #2 ("no declared fact is missing from the frame") is vacuous on an
+	 * axis the producer left empty — it compares the frame against nothing and
+	 * passes. That is how a bash timeout reached the wire with no statement of
+	 * why it stopped: the mirror into `details.notices` was gated on the same
+	 * condition that suppresses the text echo, so exactly the path that needed
+	 * it skipped it, and every check downstream had nothing to miss
+	 * (oh-my-pi/oh-my-pi#7078 review r3694816752). Pinning the producer half
+	 * makes the axis non-vacuous for this row specifically, rather than
+	 * trusting the matrix-wide guard that only asks whether *some* row
+	 * populates *some* axis.
+	 */
+	expectProducerFacts?: readonly string[];
 	/**
 	 * How many non-blank lines of the producer's own final body text
-	 * (`producerFinalBodyText`) may legitimately never reach the client on any
+	 * (`producerFinalBodyText`) legitimately never reach the client on any
 	 * rendered channel. Declared per row, default 0 — a real omission (this
 	 * PR's own eval-annotation regression, oh-my-pi/oh-my-pi#7078 review
 	 * r3693523855) is never an allowance to grant, only a `plain` mode's own
 	 * `ACP_TEXT_LIMIT` head truncation on a body that exceeds it legitimately
-	 * earns one.
+	 * earns one. Asserted for equality, same reason as `discontinuities`.
 	 */
-	allowUndeliveredFinalLines?: number;
-	modes?: readonly ModeName[];
+	allowUndeliveredFinalLines?: number | Partial<Record<ModeName, number>>;
+	/**
+	 * Modes this row does *not* run in, each with the reason no such
+	 * combination exists. Every row runs in all four modes otherwise: a mode
+	 * a row silently never entered is a hole nothing reports, which is how
+	 * `bash × timeout × meta` — the delta/watermark world, where the densest
+	 * findings in this subsystem live — went uncovered while a `zed`-only
+	 * timeout row looked like coverage.
+	 */
+	modeSkips?: Partial<Record<ModeName, string>>;
 }
 
 function makeEvalSession(): ToolSession {
@@ -592,6 +647,27 @@ async function runTimingOutBridgeBash(toolCallId: string): Promise<ProducerOutco
 }
 
 /**
+ * The same timeout through the *local* executor — no client bridge, so
+ * `executeBash` owns the process and `sink.dump("Command timed out after N
+ * seconds")` bakes the annotation into `output` without streaming it through
+ * `onChunk` (`bash-executor.ts`). This is the row the matrix never had: the
+ * bridge row above only ran in modes with a real terminal, so no bash timeout
+ * ever reached the display-only meta-terminal path where the delta/watermark
+ * classifier decides what a re-rendered final body still owes the client
+ * (oh-my-pi/oh-my-pi#7078 review r3694816752). The command prints first so the
+ * watermark is non-empty when the annotation-prefixed final snapshot arrives —
+ * an empty watermark takes the first-send path and proves nothing.
+ */
+async function runTimingOutLocalBash(toolCallId: string): Promise<ProducerOutcome> {
+	const { session } = makeSpillingSession();
+	const args = { command: "printf 'working\\n'; sleep 30", timeout: 1 };
+	const tool = wrapToolWithMetaNotice(new BashTool(session));
+	const updates: AgentToolResult<unknown>[] = [];
+	const result = await tool.execute(toolCallId, args, undefined, update => updates.push(update));
+	return { toolName: "bash", args, result, updates };
+}
+
+/**
  * `hub start` against a daemon the broker reports as `failed`. The op records
  * that only in `details.daemon.state`, which the TUI card reads and the ACP
  * mapper cannot — so the producer marks the result-level flag now.
@@ -683,11 +759,19 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		run: id => runBash(id, { command: SPILLING_COMMAND }),
 		status: "completed",
 		exitCode: 0,
-		// ~110 KB through a 50 KB tail buffer: the bytes between the first
-		// snapshot and the second really are gone before the mapper sees them,
-		// so exactly one honest discontinuity notice is expected. Two means the
-		// final re-rendered summary was misread as a rollover as well.
-		discontinuities: 1,
+		// `seq 1 20000` is ~110 KB of variable-width lines through a 50 KB tail
+		// buffer. Whether the mapper ever sees a snapshot gap wider than that
+		// window depends on pipe read sizes, so 0 and 1 are both honest for
+		// this stream and pinning either one would be a coin flip dressed as an
+		// assertion. Two is not: that is the final re-rendered summary being
+		// misread as a rollover on top of a genuine one. The deterministic
+		// counterpart lives in the fixed-width row below, which pins 1 exactly.
+		discontinuities: {
+			upTo: 1,
+			because: "pipe read sizes decide whether one delta exceeds the 50 KB window; both 0 and 1 are honest here",
+		},
+		producerDroppedBytes:
+			"OutputSink elides the middle of a 110 KB run into a head+tail summary; the elided lines exist only in artifact://<id>",
 	},
 	{
 		name: "bash, middle-elided summary after a rolled tail window",
@@ -700,13 +784,26 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		// which is a re-render of what already streamed, not a continuation of
 		// it — came with a duplicate copy of the whole summary.
 		discontinuities: 1,
+		producerDroppedBytes:
+			"the 50 KB tail window rolls twice across a 192 KB run, so the final summary's middle never reached the mapper",
 	},
 	{
 		name: "bash, timeout with a live client terminal",
 		run: runTimingOutBridgeBash,
 		status: "failed",
 		terminalId: HUNG_TERMINAL_ID,
-		modes: ["zed", "real-terminal-only"],
+		// The client's terminal only ever received process bytes; the timeout
+		// annotation is not one, so `details.notices` is the only channel that
+		// can tell the user why the command stopped.
+		expectProducerFacts: ["Command timed out"],
+	},
+	{
+		name: "bash, timeout on the local executor",
+		run: runTimingOutLocalBash,
+		status: "failed",
+		// `sink.dump(notice)` composes this into the body without streaming it,
+		// so the structural mirror has to exist independently of the text.
+		expectProducerFacts: ["Command timed out"],
 	},
 	{
 		name: "eval, exit 0",
@@ -760,9 +857,14 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		run: id => runStreamingEval(id, 2500),
 		status: "completed",
 		exitCode: 0,
-		// 160 KB through eval's 100 KB window: the bytes in between are gone
-		// before the mapper can see them, so one honest discontinuity notice.
-		discontinuities: 1,
+		// 160 KB through eval's 100 KB window, but the producer emits an
+		// `onUpdate` per chunk, so consecutive snapshots always overlap and the
+		// mapper never loses its place: zero honest discontinuities. The row
+		// declared 1 under a `toBeLessThanOrEqual` budget, so the declaration
+		// was never checked against what actually happens — the exact-equality
+		// assertion is what surfaced it.
+		producerDroppedBytes:
+			"160 KB through eval's own TailBuffer(100 KB): the middle of the final summary was evicted before the mapper saw it",
 	},
 	{
 		name: "eval, image display output",
@@ -797,6 +899,160 @@ const PRODUCER_CASES: readonly ProducerCase[] = [
 		allowUndeliveredFinalLines: 1,
 	},
 ];
+
+/**
+ * The cross-product this matrix claims to cover, written down so a hole is a
+ * failure instead of an absence nobody can see.
+ *
+ * Every finding in this review's ACP rounds lived in a cell no row occupied,
+ * and the matrix could not say so: rows accumulated one per bug, modes were an
+ * opt-in allowlist, and "the matrix covers it" was unfalsifiable. A cell is
+ * either the name of a row that exercises it or an explicit `{ none: reason }`
+ * saying why no real producer can reach it — and the assertions below reject a
+ * cell that names a row which doesn't exist, a row no cell names, and a
+ * `none` reason that isn't a reason.
+ */
+type OutcomeName =
+	| "success"
+	| "nonzero exit"
+	| "timeout"
+	| "abort"
+	| "artifact spill"
+	| "tail-window rollover"
+	| "image"
+	| "stdin request"
+	| "details-only notice"
+	| "partial failure";
+
+type CoverageCell = string | { none: string };
+
+const COVERAGE: Record<string, Record<OutcomeName, CoverageCell>> = {
+	bash: {
+		success: "bash, exit 0",
+		"nonzero exit": "bash, nonzero exit",
+		timeout: "bash, timeout on the local executor",
+		abort: {
+			none: "an abort throws rather than returning a result (bash.ts's `#throwIfUnfinished`, deliberate: an abort is not a completed command), so there is no producer result to feed the mapper",
+		},
+		"artifact spill": "bash, output spilled to an artifact",
+		"tail-window rollover": "bash, middle-elided summary after a rolled tail window",
+		image: { none: "bash returns text only; no code path produces an image result" },
+		"stdin request": { none: "bash never asks for stdin; the eval kernels do" },
+		"details-only notice": {
+			none: "bash always mirrors its notices into `details.notices`; the details-only axis belongs to eval's `details.notice`",
+		},
+		"partial failure": { none: "a single command either ran or did not; no per-item breakdown exists" },
+	},
+	"bash (client terminal)": {
+		success: {
+			none: "a successful bridge command's body streams over the `terminal/output` RPC only; the frame carries the terminal reference, which the timeout row already pins",
+		},
+		"nonzero exit": { none: "same channel as success, above" },
+		timeout: "bash, timeout with a live client terminal",
+		abort: { none: "throws, as in the local-executor row above" },
+		"artifact spill": { none: "the client owns the buffer; the sink's spill path is the local executor's" },
+		"tail-window rollover": { none: "the client owns the buffer, so no mapper-side window rolls" },
+		image: { none: "bash returns text only" },
+		"stdin request": { none: "bash never asks for stdin" },
+		"details-only notice": { none: "as in the local-executor row above" },
+		"partial failure": { none: "as in the local-executor row above" },
+	},
+	eval: {
+		success: "eval, exit 0",
+		"nonzero exit": "eval, nonzero exit",
+		timeout: "eval via python kernel, kernel timeout mid-stream",
+		abort: "eval, aborted mid-cell",
+		"artifact spill": {
+			none: "eval bounds its own output with a `TailBuffer` instead of the sink's artifact spill; the rollover row covers the loss it can suffer",
+		},
+		"tail-window rollover": "eval, streamed past its own tail-buffer window",
+		image: "eval, image display output",
+		"stdin request": "eval via python kernel, stdin requested",
+		"details-only notice": "eval via proxyExecutor, details.notice",
+		"partial failure": {
+			none: "`EvalTool.execute()`'s public entrypoint always builds a single cell (`evalCellCommonFields`), so no cell can fail beside a sibling that succeeded",
+		},
+	},
+	hub: {
+		success: "hub describe of an already-failed daemon",
+		"nonzero exit": "hub start, daemon reported failed",
+		timeout: { none: "a readiness timeout is reported as a failed daemon state, which the nonzero-exit row covers" },
+		abort: { none: "the op is an RPC round trip with nothing to abort mid-stream" },
+		"artifact spill": { none: "hub op results are small structured payloads, never streamed output" },
+		"tail-window rollover": { none: "no streamed output, so no window" },
+		image: { none: "hub returns text only" },
+		"stdin request": { none: "no interactive input path" },
+		"details-only notice": { none: "hub records its facts in `details.daemon`, covered by the two rows above" },
+		"partial failure": { none: "one op addresses one daemon" },
+	},
+	edit: {
+		success: {
+			none: "a fully successful edit renders as diffs alone, covered by `acp-event-mapper.test.ts`'s diff branches",
+		},
+		"nonzero exit": { none: "an edit has no process and therefore no exit code" },
+		timeout: { none: "no process to time out" },
+		abort: { none: "an aborted edit throws; see bash's abort cell" },
+		"artifact spill": { none: "edit results are diffs, bounded by the snapshot budget rather than the output sink" },
+		"tail-window rollover": { none: "no streamed output, so no window" },
+		image: { none: "edit returns diffs and text only" },
+		"stdin request": { none: "no interactive input path" },
+		"details-only notice": { none: "edit's notices ride in `details.meta`, exercised by the partial-failure row" },
+		"partial failure": "edit, multi-file patch with one missing file",
+	},
+};
+
+describe("ACP producer matrix coverage", () => {
+	const rowNames = new Set(PRODUCER_CASES.map(producerCase => producerCase.name));
+	const namedRows = new Set<string>();
+
+	for (const [producer, outcomes] of Object.entries(COVERAGE)) {
+		for (const [outcome, cell] of Object.entries(outcomes)) {
+			it(`declares ${producer} × ${outcome}`, () => {
+				if (typeof cell === "string") {
+					expect(rowNames.has(cell), `no producer row named ${JSON.stringify(cell)}`).toBe(true);
+					namedRows.add(cell);
+					return;
+				}
+				// A hole is allowed; an unexplained hole is not. The reason has
+				// to name what the producer structurally cannot do, which is
+				// what makes it reviewable against the source instead of being
+				// a way to keep the table green.
+				expect(cell.none.length).toBeGreaterThan(20);
+			});
+		}
+	}
+
+	it("names every producer row in the table", () => {
+		for (const cell of Object.values(COVERAGE).flatMap(outcomes => Object.values(outcomes))) {
+			if (typeof cell === "string") namedRows.add(cell);
+		}
+		expect([...rowNames].filter(name => !namedRows.has(name))).toEqual([]);
+	});
+
+	it("gives every skipped mode a reason", () => {
+		for (const producerCase of PRODUCER_CASES) {
+			for (const [mode, reason] of Object.entries(producerCase.modeSkips ?? {})) {
+				expect(MODE_NAMES.includes(mode as ModeName), `unknown mode ${mode}`).toBe(true);
+				expect(reason.length, `${producerCase.name} → ${mode}`).toBeGreaterThan(20);
+			}
+		}
+	});
+
+	it("gives every non-exact allowance a reason", () => {
+		// An exemption is only defensible if it names what the producer or the
+		// client is structurally incapable of. Requiring the prose is what
+		// stops the next red row from being turned green with a number.
+		for (const producerCase of PRODUCER_CASES) {
+			const rolls = producerCase.discontinuities;
+			if (typeof rolls === "object") {
+				expect(rolls.because.length, `${producerCase.name} discontinuities`).toBeGreaterThan(20);
+			}
+			if (producerCase.producerDroppedBytes !== undefined) {
+				expect(producerCase.producerDroppedBytes.length, `${producerCase.name} dropped bytes`).toBeGreaterThan(20);
+			}
+		}
+	});
+});
 
 /**
  * Bytes a client would append to the display-only terminal, in delivery order.
@@ -884,10 +1140,14 @@ function expectAppendOnly(chunks: readonly string[]): void {
 	}
 }
 
+const MODE_NAMES = Object.keys(MODES) as readonly ModeName[];
+
 describe("ACP producer matrix", () => {
 	for (const producerCase of PRODUCER_CASES) {
-		for (const modeName of producerCase.modes ?? (["zed", "meta", "plain"] as const)) {
-			it(`${producerCase.name} → ${modeName}`, async () => {
+		for (const modeName of MODE_NAMES) {
+			const skipReason = producerCase.modeSkips?.[modeName];
+			const run = skipReason ? it.skip : it;
+			run(`${producerCase.name} → ${modeName}${skipReason ? ` (skipped: ${skipReason})` : ""}`, async () => {
 				const toolCallId = `matrix-${producerCase.name.replace(/[^a-z0-9]+/gi, "-")}-${modeName}`;
 				const outcome = await producerCase.run(toolCallId);
 				const mode = MODES[modeName];
@@ -901,16 +1161,31 @@ describe("ACP producer matrix", () => {
 				if (exit) {
 					expect(exit.exit_code).toBe(producerCase.exitCode);
 				}
-				if (producerCase.terminalId) {
-					const content = update.content as Array<{ type: string; terminalId?: string }> | undefined;
-					expect(
-						content?.some(item => item.type === "terminal" && item.terminalId === producerCase.terminalId),
-					).toBe(true);
+				// Whether the frame actually hands the user off to a real,
+				// client-owned terminal — derived from the frame, never declared,
+				// because it is mode-dependent: the same producer that created a
+				// client terminal renders through the display-only convention in
+				// `meta` mode, where its body is the mapper's job again. Declaring
+				// it per row is what exempted `bash × timeout` from check #6 in
+				// every mode, including the one where the check applies.
+				const rendersClientTerminal =
+					producerCase.terminalId !== undefined &&
+					(update.content as Array<{ type: string; terminalId?: string }> | undefined)?.some(
+						item => item.type === "terminal" && item.terminalId === producerCase.terminalId,
+					) === true;
+				if (producerCase.terminalId && mode.realTerminalCapable) {
+					expect(rendersClientTerminal).toBe(true);
 				}
 
-				// 2. No structurally-recorded producer fact silently dropped.
+				// 2. No structurally-recorded producer fact silently dropped —
+				// and, for a row that names them, the producer really did record
+				// them, so the comparison isn't against an empty set.
+				const declared = producerFacts(outcome.result);
+				for (const expected of producerCase.expectProducerFacts ?? []) {
+					expect(declared.join("\n"), "producer recorded no such fact").toContain(expected);
+				}
 				const texts = [...frameTexts(update), ...terminalChunks].join("\n");
-				for (const fact of producerFacts(outcome.result)) {
+				for (const fact of declared) {
 					expect(texts).toContain(fact);
 				}
 
@@ -920,9 +1195,21 @@ describe("ACP producer matrix", () => {
 				// 4. No fabricated data loss. The replay feeds the mapper every
 				// snapshot the producer emitted, so it may only claim dropped
 				// bytes when the producer's own tail buffer rolled between two of
-				// them — declared per row, never inferred from the frames.
+				// them. The producer-side count is declared per row; the wire
+				// budget is derived, because only a display-only meta terminal
+				// has a mapper-owned buffer to lose its place in — every other
+				// mode must carry exactly zero, and asserting equality means a
+				// stale allowance fails instead of hiding a fabrication.
 				const claimed = terminalChunks.filter(chunk => chunk.includes(DISCONTINUITY_MARKER)).length;
-				expect(claimed).toBeLessThanOrEqual(producerCase.discontinuities ?? 0);
+				const usesMetaTerminal = wantsMetaTerminal(outcome.toolName, outcome.args, mode);
+				const declaredRolls = producerCase.discontinuities ?? 0;
+				if (!usesMetaTerminal) {
+					expect(claimed).toBe(0);
+				} else if (typeof declaredRolls === "number") {
+					expect(claimed).toBe(declaredRolls);
+				} else {
+					expect(claimed).toBeLessThanOrEqual(declaredRolls.upTo);
+				}
 
 				// 5. Wire invariants, same check `AcpAgent#sendUpdate` runs.
 				expect(checkAcpUpdateInvariants(frames[0]!, { terminalMetaCapable: mode.terminalMetaCapable })).toEqual([]);
@@ -933,24 +1220,25 @@ describe("ACP producer matrix", () => {
 				// authoritative text a plain-content client would show, so a
 				// fact synthesized straight into that text (never declared as a
 				// separate structural field) still has to survive somewhere.
-				// Exempt rows with a real client-owned terminal (`terminalId`):
-				// their body is delivered out-of-band over the actual
-				// `terminal/output` RPC channel a client polls independently of
-				// `session/update`, which this in-process replay never sees —
-				// checking against it would be a structural false positive, not
-				// a signal.
-				// Skip for rows with a real client-owned terminal (out-of-band
-				// delivery, above) *or* a declared discontinuity: check #4
-				// already independently vouches for that exact loss, with the
-				// right granularity (a bounded, honest discontinuity count),
-				// not a byte-for-byte line diff against a middle-elided summary
-				// that can legitimately span thousands of line numbers.
-				if (!producerCase.terminalId && !producerCase.discontinuities) {
+				//
+				// Two exemptions, both structural rather than convenient: a frame
+				// that renders a real client-owned terminal delivers its body
+				// out-of-band over the `terminal/output` RPC a client polls
+				// independently of `session/update`, invisible to an in-process
+				// replay by construction; and a producer that destroyed part of
+				// its own body before handing it over (`producerDroppedBytes`)
+				// leaves nothing any channel could deliver — that loss is
+				// acknowledged by its own elision notice (check #2) and bounded
+				// by check #4, at a granularity a line diff against a
+				// thousands-of-lines summary cannot express.
+				if (!rendersClientTerminal && !producerCase.producerDroppedBytes) {
+					const allowed =
+						typeof producerCase.allowUndeliveredFinalLines === "object"
+							? (producerCase.allowUndeliveredFinalLines[modeName] ?? 0)
+							: (producerCase.allowUndeliveredFinalLines ?? 0);
 					const finalBodyText = producerFinalBodyText(outcome.result);
 					const missing = missingFinalBodyLines(finalBodyText, allDeliveredTexts);
-					expect(missing.length, `undelivered final-body lines: ${JSON.stringify(missing)}`).toBeLessThanOrEqual(
-						producerCase.allowUndeliveredFinalLines ?? 0,
-					);
+					expect(missing.length, `undelivered final-body lines: ${JSON.stringify(missing)}`).toBe(allowed);
 				}
 			});
 		}
