@@ -507,10 +507,11 @@ export class AcpAgent implements Agent {
 
 	/**
 	 * Single emit chokepoint for every outbound `session/update` — checks the
-	 * finished frame against `docs/acp-development.md` rules 7 (a terminal
-	 * content item must be the update's only content item) and 9 (an
-	 * `_meta.terminal_*` key requires the negotiated capability) before
-	 * forwarding it unchanged. See `acp-update-invariants.ts` for why this
+	 * finished frame against `checkAcpUpdateInvariants` (a terminal content item
+	 * must be the update's only content item; an `_meta.terminal_*` key requires
+	 * the negotiated capability; a completed status must not sit above a nonzero
+	 * exit code) before forwarding it unchanged. See
+	 * `acp-update-invariants.ts` for why this
 	 * needs to run on the assembled frame rather than at each builder: a
 	 * violation is often only visible after content arrays from different
 	 * builders are merged. Returns the connection's promise directly (not

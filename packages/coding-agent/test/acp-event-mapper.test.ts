@@ -35,7 +35,7 @@ import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-sch
 
 /**
  * Every mapper call in this suite goes through here so the wire-level
- * invariants (`docs/acp-development.md` rules 7 and 9) are checked on the
+ * invariants (`checkAcpUpdateInvariants`) are checked on the
  * frames this suite builds. The production chokepoint (`AcpAgent#sendUpdate`)
  * sits one layer above the mapper, so without this wrapper the bulk of ACP
  * frame coverage — every test that calls the mapper directly — validated only

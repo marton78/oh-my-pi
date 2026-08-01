@@ -1,8 +1,9 @@
 /**
  * Wire-level postcondition checks for every outbound `session/update`.
  *
- * Three ACP invariants (`docs/acp-development.md` rules 7, 9 and 14) are
- * properties of the *emitted frame*, not of any one code path that builds it:
+ * Three ACP invariants (the "Enforced invariants" table in
+ * `docs/acp-development.md`) are properties of the *emitted frame*, not of any
+ * one code path that builds it:
  *
  * 1. For a client that negotiated `clientCapabilities._meta.terminal_output`
  *    (Zed always does — `agent_servers/acp.rs:757`), a terminal-bearing
