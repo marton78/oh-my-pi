@@ -42,6 +42,29 @@
 - Fixed explicit `thinking` metadata in `models.yml` custom definitions and `modelOverrides` being replaced by canonical catalog policy during model rebuilding. ([#7307](https://github.com/can1357/oh-my-pi/issues/7307))
 - Fixed the auto-titler installing a model's whole answer as the session title when the tiny title model ignored the titling task and answered the first user message instead. `normalizeGeneratedTitle` now rejects overlong output (>80 chars or >12 words) so the caller defers titling to the next user turn rather than accepting a full sentence ([#7303](https://github.com/can1357/oh-my-pi/issues/7303)).
 - Fixed the in-process `kill` builtin to validate signals, preserve negative PID operands, signal every process in pipeline jobs, continue after bad targets, and refuse non-probe signals aimed at the host process or process group.
+- A failing `eval` cell (nonzero exit or cancellation) now marks its tool result as an error at the result level, matching `bash`'s nonzero-exit behavior, instead of recording the failure only in the result's `details`.
+- ACP fixes:
+	- Fixed a `bash`/`shell`/`exec` timeout showing partial output and no reason for stopping in an ACP terminal card: the timeout annotation was composed into the result text and never recorded as a structured fact, which is the only channel a terminal card reads.
+	- ACP terminal cards now reconcile a small, bounded tail (up to 8 lines / 2 KB) of a tool's own final output that reached no rendered channel, so a synthesized annotation a tool writes into its text without declaring it structurally no longer disappears.
+	- Fixed ACP `eval`'s kernel-timeout and stdin-requested notices reaching only the model-facing text instead of the terminal card.
+	- Fixed an ACP `eval` call's source code disappearing from the rendered card when replaying an interrupted eval via `session/load`, or when the eval produced an image.
+	- Fixed a failing `eval` reporting a successful ACP status and a synthesized exit code 0, even though its terminal output showed a nonzero exit.
+	- Fixed an ACP `eval` result's notice and error message being dropped when an image forced the meta-terminal fallback to a plain content card.
+	- Fixed a `bash`/`shell`/`exec` timeout in a client-owned ACP terminal replacing the live terminal card with plain text and losing its notices.
+	- Fixed an ACP tool call whose result carries an image, audio, or resource block beside a live terminal rendering as a terminal card that hides that content; it now falls back to a plain content card.
+	- Fixed identical LSP diagnostics on two edited files collapsing into one notice that named only the first file.
+	- Fixed large tool output losing its truncation notice and `artifact://` recovery pointer for ACP clients without terminal support.
+	- Fixed `hub start`/`restart` reporting a daemon that failed to launch as a successful tool call.
+	- Fixed a large command's output being duplicated in an ACP display-only terminal under a false "earlier bytes were dropped" warning.
+	- Enforced ACP terminal-content and unnegotiated-extension invariants on every outbound `session/update`, instead of catching each case only in review.
+	- Fixed the ACP meta-terminal convention re-sending already-streamed output with a false discontinuity notice when a tool's final result was a reformatted re-render rather than new output.
+	- Fixed the ACP terminal-sibling invariant firing on real-terminal clients that hadn't negotiated Zed's terminal extension.
+	- Fixed the ACP terminal path dropping the truncation/`artifact://` recovery notice when output was already elided before the final byte cap ran.
+	- Fixed resumed ACP sessions (`session/load`) replaying bash/shell/exec calls as empty terminal cards; recorded output now renders as a code block when the terminal isn't live on the current connection.
+	- Fixed ACP live terminal cards losing bash's post-stream notices (exit code, truncation, `artifact://` pointer).
+	- Fixed a framework-level error message being dropped from an ACP tool call that also carried structured content blocks.
+	- Fixed ACP command output escaping its Markdown code fence when the output contained an indented backtick run.
+	- Fixed a malformed custom or MCP tool result whose `details` mimics an edit result throwing inside the mapper (dropping the whole update) or emitting non-string snapshots in an ACP `diff`; such results now fall back to plain content.
 
 ## [17.2.3] - 2026-08-01
 
@@ -56,27 +79,6 @@
 - Fixed ephemeral side turns and native compaction bypassing an explicit or fork-inherited prompt cache key ([#7218](https://github.com/can1357/oh-my-pi/issues/7218)).
 - Fixed the live Ask dialog crashing the whole session with a `replaceTabs` TypeError when a question reached `AskDialogComponent` without a string `question` field; questions are now normalized at dialog entry, mirroring the transcript renderer ([#7211](https://github.com/can1357/oh-my-pi/issues/7211)).
 - Fixed Codex web search collapsing backend errors to `Codex error (): Unknown error`; the SSE error parser now preserves the backend code and message from top-level, nested `error`, and `response.error` envelopes ([#7200](https://github.com/can1357/oh-my-pi/issues/7200)).
-### Fixed
-
-- ACP fixes:
-	- Fixed a `bash`/`shell`/`exec` timeout showing partial output and no reason for stopping in an ACP terminal card: the timeout annotation was composed into the result text and never recorded as a structured fact, which is the only channel a terminal card reads.
-	- ACP terminal cards now recover any line of a tool's own final output that reached no rendered channel, so a fact a tool writes into its text without declaring it structurally no longer disappears.
-	- Fixed ACP `eval`'s kernel-timeout and stdin-requested notices reaching only the model-facing text instead of the terminal card.
-	- Fixed an ACP `eval` call's source code disappearing from the rendered card when replaying an interrupted eval via `session/load`, or when the eval produced an image.
-	- Fixed a failing `eval` reporting a successful ACP status and a synthesized exit code 0, even though its terminal output showed a nonzero exit.
-	- Fixed an ACP `eval` result's notice and error message being dropped when an image forced the meta-terminal fallback to a plain content card.
-	- Fixed a `bash`/`shell`/`exec` timeout in a client-owned ACP terminal replacing the live terminal card with plain text and losing its notices.
-	- Fixed large tool output losing its truncation notice and `artifact://` recovery pointer for ACP clients without terminal support.
-	- Fixed `hub start`/`restart` reporting a daemon that failed to launch as a successful tool call.
-	- Fixed a large command's output being duplicated in an ACP display-only terminal under a false "earlier bytes were dropped" warning.
-	- Enforced ACP terminal-content and unnegotiated-extension invariants on every outbound `session/update`, instead of catching each case only in review.
-	- Fixed the ACP meta-terminal convention re-sending already-streamed output with a false discontinuity notice when a tool's final result was a reformatted re-render rather than new output.
-	- Fixed the ACP terminal-sibling invariant firing on real-terminal clients that hadn't negotiated Zed's terminal extension.
-	- Fixed the ACP terminal path dropping the truncation/`artifact://` recovery notice when output was already elided before the final byte cap ran.
-	- Fixed resumed ACP sessions (`session/load`) replaying bash/shell/exec calls as empty terminal cards; recorded output now renders as a code block when the terminal isn't live on the current connection.
-	- Fixed ACP live terminal cards losing bash's post-stream notices (exit code, truncation, `artifact://` pointer).
-	- Fixed a framework-level error message being dropped from an ACP tool call that also carried structured content blocks.
-	- Fixed ACP command output escaping its Markdown code fence when the output contained an indented backtick run.
 
 ## [17.2.2] - 2026-07-31
 
