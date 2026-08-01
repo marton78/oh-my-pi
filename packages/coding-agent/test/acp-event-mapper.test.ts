@@ -1464,6 +1464,37 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("uses plain content for a live-terminal result containing binary content", () => {
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-image",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [
+						{ type: "text", text: "generated image" },
+						{ type: "image", data: "base64-image-data", mimeType: "image/png" },
+					],
+					details: { terminalId: "term-image" },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		);
+
+		const update = updates[0]!.update as { content?: ToolCallContent[] };
+		expect(update.content?.some(item => item.type === "terminal")).toBe(false);
+		expect(update.content).toContainEqual({
+			type: "content",
+			content: { type: "image", data: "base64-image-data", mimeType: "image/png" },
+		});
+		expect(update.content).toContainEqual({
+			type: "content",
+			content: { type: "text", text: "```\ngenerated image\n```" },
+		});
+	});
+
 	it("falls back to sibling content for live-terminal notices when the client hasn't negotiated _meta.terminal_output", () => {
 		// Regression test: a client can advertise real ACP terminal support
 		// (`terminal: true`) without negotiating Zed's ad hoc

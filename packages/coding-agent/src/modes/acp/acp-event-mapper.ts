@@ -1845,6 +1845,12 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions, 
 		// for exactly this reason — it must never flag this fallback branch.
 		const notices = options.terminalMetaCapable ? undefined : extractTerminalNotices(value);
 		const nonTextContent = combinedContent.filter(item => !(item.type === "content" && item.content.type === "text"));
+		if (options.terminalMetaCapable && nonTextContent.length > 0) {
+			const directText = extractDirectText(value);
+			return directText && !hasEquivalentTextContent(combinedContent, directText)
+				? [...combinedContent, textToolCallContent(directText)]
+				: combinedContent;
+		}
 		const withTerminal = hasTerminalContent(nonTextContent, terminalId)
 			? nonTextContent
 			: [...nonTextContent, terminalToolCallContent(terminalId)];
