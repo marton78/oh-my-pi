@@ -485,7 +485,17 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				// (`agent_servers/acp.rs`) writes `_meta.terminal_output` straight
 				// into whatever terminal buffer already owns that id, so this
 				// genuinely renders inside the live card instead of vanishing.
-				const liveTerminalNoticeMeta = buildLiveTerminalNoticeMeta(event.result, event.toolName, args, options);
+				//
+				// Only when the frame still has that terminal item to write into:
+				// `extractToolCallContent`'s binary-content fallback (an image/
+				// audio/resource result) drops the terminal item and returns the
+				// notices visibly instead (`recoverTruncatedNoticeContent` already
+				// ran above), so writing them again into a buffer this frame no
+				// longer references would be a second, invisible delivery.
+				const hasTerminalItem = content.some(item => item.type === "terminal");
+				const liveTerminalNoticeMeta = hasTerminalItem
+					? buildLiveTerminalNoticeMeta(event.result, event.toolName, args, options)
+					: undefined;
 				if (liveTerminalNoticeMeta) {
 					update._meta = liveTerminalNoticeMeta;
 				}

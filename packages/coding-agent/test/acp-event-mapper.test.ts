@@ -1464,6 +1464,44 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	// Extends the binary-content fallback above: `details.notices` (bash's
+	// exit code/wall-time/artifact notes) has no live terminal buffer to ride
+	// in once the terminal item is dropped, so it must surface visibly
+	// instead of via `buildLiveTerminalNoticeMeta` — writing it there too
+	// would be a second, invisible delivery into a buffer this frame no
+	// longer references (oh-my-pi/oh-my-pi#7078 follow-up).
+	it("recovers notices visibly, with no _meta.terminal_output, for a live-terminal binary-content result", () => {
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-terminal-image-notices",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [
+						{ type: "text", text: "generated image" },
+						{ type: "image", data: "base64-image-data", mimeType: "image/png" },
+					],
+					details: { terminalId: "term-image-notices", notices: ["Wall time: 2.00 seconds"] },
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ terminalMetaCapable: true, realTerminalCapable: true },
+		);
+
+		const update = updates[0]!.update as { content?: ToolCallContent[]; _meta?: Record<string, unknown> };
+		expect(update.content?.some(item => item.type === "terminal")).toBe(false);
+		const texts = (update.content ?? [])
+			.filter(
+				(item): item is { type: "content"; content: { type: "text"; text: string } } =>
+					item.type === "content" && item.content.type === "text",
+			)
+			.map(item => item.content.text)
+			.join("\n");
+		expect(texts).toContain("Wall time: 2.00 seconds");
+		expect(update._meta?.terminal_output).toBeUndefined();
+	});
+
 	it("uses plain content for a live-terminal result containing binary content", () => {
 		const updates = mapUpdates(
 			{
