@@ -335,10 +335,8 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
-			// `event.isError` is the result-level flag, which `eval` never sets:
-			// its builder records a nonzero-exit cell only in `details` (see
-			// `isFailedToolResult`), so read the failure structurally instead of
-			// reporting a failed call as completed with a synthetic exit 0.
+			// Prefer the result-level flag, but retain the details fallback for
+			// legacy replay data and external producers (see `isFailedToolResult`).
 			const failed = isFailedToolResult(event.result, event.isError);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
