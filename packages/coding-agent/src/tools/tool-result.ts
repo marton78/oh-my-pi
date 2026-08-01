@@ -106,9 +106,10 @@ export function toolResult<TDetails extends DetailsWithMeta>(details?: TDetails)
  * renderer must use.
  *
  * `isError` on the result is the authoritative flag (the agent loop derives
- * the model-facing one from it, `cursor.ts`), but legacy replay data or an
- * external producer may only mark the failure inside its own `details`.
- * `mcp/tool-bridge.ts` mirrors the server's flag into both.
+ * the model-facing one from it, `cursor.ts`), but `task/executor.ts`'s
+ * MCP-proxy branches (a re-resolved tool call, a caught execution error) mark
+ * the failure only in `details.isError` — no top-level flag alongside it.
+ * `mcp/tool-bridge.ts`'s own error path mirrors the server's flag into both.
  * Renderers that hand-rolled this fallback independently drifted apart — the
  * TUI honoured `details.isError` while the ACP mapper didn't, so a failed
  * `eval` showed a success card in Zed and an error card in the terminal UI
