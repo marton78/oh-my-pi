@@ -7,7 +7,7 @@ import type {
 	ToolKind,
 } from "@agentclientprotocol/sdk";
 import { logger } from "@oh-my-pi/pi-utils";
-import { type EditToolDetails, type EditToolPerFileResult, parseEditTargetPath } from "../../edit";
+import { parseEditTargetPath } from "../../edit";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { DEFAULT_MAX_BYTES } from "../../session/streaming-output";
@@ -151,10 +151,6 @@ interface ErrorMessageContainer {
 
 interface MessageContainer {
 	message?: unknown;
-}
-
-interface PerFileResultsContainer {
-	perFileResults?: unknown;
 }
 
 interface ResourceLinkLikeContent extends TypedValue {
@@ -1555,40 +1551,117 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
 	return locations;
 }
 
-/**
- * Narrow a tool result's `details` to `EditToolDetails`, validating
- * `perFileResults` is an array of well-shaped entries when present.
- * `unknown` at the boundary is unavoidable — arbitrary/MCP tool results have
- * no such shape — but every edit-result consumer below shares this one cast
- * instead of re-deriving its own `{ perFileResults?: unknown }` view of the
- * same field.
- *
- * Validates each entry is a non-null object with a string `path` (the one
- * field every consumer below dereferences unconditionally —
- * `extractOutputNoticeText` reads `entry.path.length`, `buildDiffContent`
- * reads `entry.isError`/`entry.path`). An extension/custom tool's arbitrary
- * `details.perFileResults` (e.g. `[{}]` or `[null]`) previously passed this
- * check as long as it was an array, so a malformed entry threw inside the
- * mapper and dropped the tool's entire ACP update instead of just skipping
- * the edit-specific rendering it doesn't apply to (oh-my-pi/oh-my-pi#7078
- * review 4823537229). Rejecting the whole `details` on a bad entry — instead
- * of trying to salvage the well-shaped ones — is deliberate: a partially
- * malformed `perFileResults` isn't a real edit result to begin with, and
- * every caller already has a non-edit fallback path.
- */
-function asEditDetails(result: unknown): EditToolDetails | undefined {
-	if (typeof result !== "object" || result === null) return undefined;
-	const details = (result as DetailsContainer).details;
-	if (typeof details !== "object" || details === null) return undefined;
-	const perFileResults = (details as PerFileResultsContainer).perFileResults;
-	if (perFileResults !== undefined) {
-		if (!Array.isArray(perFileResults)) return undefined;
-		const wellFormed = perFileResults.every(
-			entry => typeof entry === "object" && entry !== null && "path" in entry && typeof entry.path === "string",
-		);
-		if (!wellFormed) return undefined;
+interface AcpEditEntry {
+	path: string;
+	oldText?: string;
+	newText?: string;
+	isError?: boolean;
+	errorText?: string;
+	displayErrorText?: string;
+	snapshotsPruned?: boolean;
+	meta?: OutputMeta;
+}
+
+interface AcpEditDetails extends Omit<AcpEditEntry, "path"> {
+	path?: string;
+	perFileResults?: AcpEditEntry[];
+	unattemptedPaths?: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function isLineRange(value: unknown): boolean {
+	return isRecord(value) && isFiniteNumber(value.start) && isFiniteNumber(value.end);
+}
+
+function isOutputMeta(value: unknown): value is OutputMeta {
+	if (!isRecord(value)) return false;
+	const { truncation, source, diagnostics, limits } = value;
+	if (truncation !== undefined) {
+		if (!isRecord(truncation)) return false;
+		if (truncation.direction !== "head" && truncation.direction !== "tail" && truncation.direction !== "middle") {
+			return false;
+		}
+		if (
+			truncation.truncatedBy !== "lines" &&
+			truncation.truncatedBy !== "bytes" &&
+			truncation.truncatedBy !== "middle"
+		) {
+			return false;
+		}
+		for (const key of ["totalLines", "totalBytes", "outputLines", "outputBytes"] as const) {
+			if (!isFiniteNumber(truncation[key])) return false;
+		}
+		for (const key of ["maxBytes", "elidedBytes", "elidedLines", "nextOffset"] as const) {
+			if (truncation[key] !== undefined && !isFiniteNumber(truncation[key])) return false;
+		}
+		for (const key of ["shownRange", "headRange", "tailRange"] as const) {
+			if (truncation[key] !== undefined && !isLineRange(truncation[key])) return false;
+		}
+		if (truncation.artifactId !== undefined && typeof truncation.artifactId !== "string") return false;
 	}
-	return details as EditToolDetails;
+	if (source !== undefined) {
+		if (!isRecord(source) || typeof source.value !== "string") return false;
+		if (source.type !== "path" && source.type !== "url" && source.type !== "internal") return false;
+	}
+	if (diagnostics !== undefined) {
+		if (!isRecord(diagnostics) || typeof diagnostics.summary !== "string") return false;
+		if (!Array.isArray(diagnostics.messages) || !diagnostics.messages.every(message => typeof message === "string")) {
+			return false;
+		}
+	}
+	if (limits !== undefined) {
+		if (!isRecord(limits)) return false;
+		for (const key of ["matchLimit", "resultLimit", "headLimit"] as const) {
+			const limit = limits[key];
+			if (
+				limit !== undefined &&
+				(!isRecord(limit) || !isFiniteNumber(limit.reached) || !isFiniteNumber(limit.suggestion))
+			) {
+				return false;
+			}
+		}
+		const column = limits.columnTruncated;
+		if (column !== undefined && (!isRecord(column) || !isFiniteNumber(column.maxColumn))) return false;
+	}
+	return true;
+}
+
+function hasValidEditFields(value: Record<string, unknown>): boolean {
+	for (const key of ["path", "oldText", "newText", "errorText", "displayErrorText"] as const) {
+		if (value[key] !== undefined && typeof value[key] !== "string") return false;
+	}
+	for (const key of ["isError", "snapshotsPruned"] as const) {
+		if (value[key] !== undefined && typeof value[key] !== "boolean") return false;
+	}
+	return value.meta === undefined || isOutputMeta(value.meta);
+}
+
+function isAcpEditEntry(value: unknown): value is AcpEditEntry {
+	return isRecord(value) && typeof value.path === "string" && hasValidEditFields(value);
+}
+
+/** Reject malformed custom-tool details and let callers use their plain-content fallback. */
+function asEditDetails(result: unknown): AcpEditDetails | undefined {
+	if (!isRecord(result)) return undefined;
+	const details = result.details;
+	if (!isRecord(details) || !hasValidEditFields(details)) return undefined;
+	const perFileResults = details.perFileResults;
+	if (perFileResults !== undefined && (!Array.isArray(perFileResults) || !perFileResults.every(isAcpEditEntry))) {
+		return undefined;
+	}
+	const unattemptedPaths = details.unattemptedPaths;
+	if (unattemptedPaths !== undefined) {
+		if (!Array.isArray(unattemptedPaths) || !unattemptedPaths.every(path => typeof path === "string"))
+			return undefined;
+	}
+	return details as AcpEditDetails;
 }
 
 /** Pull locations from a tool result's details (e.g. EditToolDetails.perFileResults[].path). */
@@ -1612,7 +1685,7 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
 	const details = asEditDetails(result);
 	if (!details) return [];
-	const entries: (EditToolPerFileResult | EditToolDetails)[] = details.perFileResults ?? [details];
+	const entries: (AcpEditEntry | AcpEditDetails)[] = details.perFileResults ?? [details];
 	const blocks: ToolCallContent[] = [];
 	for (const entry of entries) {
 		const block = buildDiffContent(entry);

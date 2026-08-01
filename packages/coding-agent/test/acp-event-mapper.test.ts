@@ -2192,7 +2192,20 @@ describe("ACP event mapper", () => {
 				{ type: "text", text: `some output\n\n${noticeLine}` },
 				{ type: "image", data: imageData, mimeType: "image/png" },
 			],
-			details: { meta: { truncation: { direction: "tail", shownRange: { start: 2200, end: 5199 } } } },
+			details: {
+				meta: {
+					truncation: {
+						direction: "tail",
+						truncatedBy: "bytes",
+						totalLines: 5199,
+						totalBytes: 256_000,
+						outputLines: 3000,
+						outputBytes: 192_000,
+						maxBytes: 192_000,
+						shownRange: { start: 2200, end: 5199 },
+					},
+				},
+			},
 		};
 		const metaEnd = mapUpdates(
 			{
@@ -3791,5 +3804,36 @@ describe("ACP event mapper", () => {
 		);
 		const update = updates[0]!.update as { content?: { type: string; content?: { type?: string; text?: string } }[] };
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "ok" } }]);
+	});
+
+	it("falls back to plain content for malformed edit snapshots and output metadata", () => {
+		const malformedDetails = [
+			{ perFileResults: [{ path: "x.ts", oldText: 42, newText: { bad: true } }] },
+			{
+				perFileResults: [
+					{
+						path: "x.ts",
+						oldText: "before",
+						newText: "after",
+						meta: { diagnostics: { summary: "broken", messages: null } },
+					},
+				],
+			},
+		];
+
+		for (const [index, details] of malformedDetails.entries()) {
+			const updates = mapUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: `tc-malformed-edit-${index}`,
+					toolName: "custom_mcp_tool",
+					isError: false,
+					result: { content: [{ type: "text", text: "ok" }], details },
+				} as unknown as AgentSessionEvent,
+				"session-1",
+			);
+			const update = updates[0]!.update as { content?: ToolCallContent[] };
+			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "ok" } }]);
+		}
 	});
 });
