@@ -140,9 +140,8 @@ async function runSpillingBash(): Promise<{
  * A real `EvalTool.execute()` whose backend exits nonzero. The backend is
  * stubbed (deterministic, no interpreter dependency) but the result builder
  * under test is the real one — and it is the producer half of this seam: it
- * records the failure in `details.isError`/`details.cells[].exitCode` and
- * never marks the result-level `isError`, which is the only signal the ACP
- * mapper used to read.
+ * records the failure in both the authoritative result-level `isError` and
+ * the eval-specific `details.isError`/`details.cells[].exitCode` fields.
  */
 async function runFailingEval(toolCallId: string): Promise<{
 	result: AgentToolResult<EvalToolDetails | undefined>;
@@ -233,12 +232,9 @@ describe("ACP producer-to-wire crossing", () => {
 		expect(textItem?.content?.text).toContain("artifact://");
 	});
 
-	it("a real failing EvalTool result records its failure only in details", async () => {
+	it("a real failing EvalTool result records its failure at the result boundary", async () => {
 		const { result } = await runFailingEval("call-eval-fail");
-		// Precondition, and the whole reason the mapper has to look deeper:
-		// eval's result builder never calls `.error()`, so `tool_execution_end`
-		// carries `isError: false` for a cell that exited nonzero.
-		expect(result.isError).not.toBe(true);
+		expect(result.isError).toBe(true);
 		expect(result.details?.isError).toBe(true);
 		expect(result.details?.cells?.[0]?.exitCode).toBe(1);
 		expect(result.content.map(c => (c.type === "text" ? c.text : "")).join("\n")).toContain(

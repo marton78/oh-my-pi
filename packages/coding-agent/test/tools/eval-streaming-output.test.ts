@@ -167,6 +167,21 @@ describe("EvalTool live stdout streaming", () => {
 		expect(text).toBe("solo");
 	});
 
+	it("marks a cancelled eval as a top-level tool error", async () => {
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
+			baseResult({ output: "Command aborted", exitCode: undefined, cancelled: true }) as never,
+		);
+
+		const result = await new EvalTool(makeSession()).execute("call-cancelled", {
+			language: "js",
+			code: "await new Promise(() => {})",
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.isError).toBe(true);
+		expect(result.details?.cells?.[0]?.status).toBe("error");
+	});
+
 	it("preserves the column-cap notice after rebuilding the final eval summary", async () => {
 		const settings = Settings.isolated();
 		settings.set("tools.outputMaxColumns", 8);
