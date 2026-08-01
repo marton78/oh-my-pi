@@ -1280,3 +1280,114 @@ describe("ACP producer matrix vacuity guard", () => {
 		expect({ sawNotices, sawNotice, sawMeta }).toEqual({ sawNotices: true, sawNotice: true, sawMeta: true });
 	});
 });
+
+/**
+ * `asEditDetails`/`extractToolCallContent` narrow a real producer's
+ * `details` by hand (see `AcpEditFields`'s comment in the mapper): every
+ * leaf field the validators inspect is a place a malformed or degenerate
+ * value — from an extension, an MCP-proxied edit-shaped tool, or a
+ * corrupted `session/load` replay record — can reach the mapper instead of
+ * `EditToolPerFileResult`'s own type guarantees. The four review findings
+ * this closed (oh-my-pi/oh-my-pi#7078 review 4823537229 and its
+ * follow-ups) were each one specific mutation found by a reviewer; this
+ * walks every leaf of a *real* producer's `details` and mutates it six
+ * ways, so the next one is found here instead.
+ */
+describe("ACP mapper survives mutated real edit details", () => {
+	/** Every leaf path of a JSON-shaped value, dot/bracket-free — `["a", 0, "b"]` for `{a: [{b: 1}]}`. */
+	function leafPaths(value: unknown, prefix: (string | number)[] = []): (string | number)[][] {
+		if (Array.isArray(value)) {
+			return value.flatMap((item, i) => leafPaths(item, [...prefix, i]));
+		}
+		if (value !== null && typeof value === "object") {
+			const entries = Object.entries(value as Record<string, unknown>);
+			if (entries.length === 0) return prefix.length > 0 ? [prefix] : [];
+			return entries.flatMap(([key, v]) => leafPaths(v, [...prefix, key]));
+		}
+		return prefix.length > 0 ? [prefix] : [];
+	}
+
+	/** Deep-clone `root`, apply `mutate` at `path`, deleting the key if `mutate` returns the sentinel. */
+	const DELETE_KEY = Symbol("delete");
+	function withMutation(root: unknown, path: (string | number)[], mutate: (leaf: unknown) => unknown): unknown {
+		const clone = structuredClone(root as Record<string, unknown>);
+		let parent: Record<string, unknown> | unknown[] = clone as Record<string, unknown>;
+		for (let i = 0; i < path.length - 1; i++) {
+			parent = (parent as Record<string | number, unknown>)[path[i]!] as Record<string, unknown> | unknown[];
+		}
+		const key = path[path.length - 1]!;
+		const container = parent as Record<string | number, unknown>;
+		const replacement = mutate(container[key]);
+		if (replacement === DELETE_KEY) {
+			if (Array.isArray(container)) container.splice(key as number, 1);
+			else delete container[key as string];
+		} else {
+			container[key] = replacement;
+		}
+		return clone;
+	}
+
+	const MUTATIONS: { name: string; apply: (leaf: unknown) => unknown }[] = [
+		{ name: "delete", apply: () => DELETE_KEY },
+		{ name: "null", apply: () => null },
+		{ name: "number", apply: () => 42 },
+		{ name: "string", apply: () => "mutated" },
+		{ name: "object", apply: () => ({}) },
+		{ name: "array", apply: () => [] },
+	];
+
+	interface MinimalToolCallUpdate {
+		sessionUpdate?: string;
+		content?: unknown[];
+		_meta?: Record<string, unknown>;
+	}
+
+	it("never throws and always emits one well-formed frame for a mutated real edit result", async () => {
+		const { result } = await runPartiallyFailingEdit("mutation-base");
+		const details: unknown = result.details;
+		expect(typeof details).toBe("object");
+		const paths = leafPaths(details);
+		expect(paths.length).toBeGreaterThan(5); // guards against a degenerate fixture with nothing to mutate
+
+		const failures: string[] = [];
+		for (const path of paths) {
+			for (const mutation of MUTATIONS) {
+				const original = path.reduce<unknown>((v, key) => (v as Record<string | number, unknown>)[key], details);
+				// Skip a no-op mutation (e.g. "string" on a field already a string
+				// with the same value) — it proves nothing about malformed input.
+				if (mutation.name === "string" && original === "mutated") continue;
+				const mutatedDetails = withMutation(details, path, mutation.apply);
+				const label = `${path.join(".")} → ${mutation.name}`;
+				for (const [modeName, mode] of Object.entries(MODES)) {
+					const event = {
+						type: "tool_execution_end",
+						toolCallId: `mutation-${label}-${modeName}`,
+						toolName: "edit",
+						isError: result.isError === true,
+						result: { content: result.content, details: mutatedDetails },
+					} as unknown as AgentSessionEvent;
+					try {
+						const notifications = mapAgentSessionEventToAcpSessionUpdates(event, "session-1", mode);
+						const updateNotifications = notifications.filter(
+							n => (n.update as MinimalToolCallUpdate).sessionUpdate === "tool_call_update",
+						);
+						if (updateNotifications.length !== 1) {
+							failures.push(`${label} [${modeName}]: expected exactly 1 tool_call_update, got ${updateNotifications.length}`);
+							continue;
+						}
+						const violations = checkAcpUpdateInvariants(updateNotifications[0]!, {
+							terminalMetaCapable: mode.terminalMetaCapable,
+						});
+						if (violations.length > 0) failures.push(`${label} [${modeName}]: ${violations.join("; ")}`);
+						const update = updateNotifications[0]!.update as MinimalToolCallUpdate;
+						const nonEmpty = (update.content !== undefined && update.content.length > 0) || update._meta !== undefined;
+						if (!nonEmpty) failures.push(`${label} [${modeName}]: emitted an empty frame`);
+					} catch (error) {
+						failures.push(`${label} [${modeName}]: ${error instanceof Error ? error.message : String(error)}`);
+					}
+				}
+			}
+		}
+		expect(failures).toEqual([]);
+	});
+});
