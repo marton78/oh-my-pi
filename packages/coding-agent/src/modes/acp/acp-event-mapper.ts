@@ -7,11 +7,11 @@ import type {
 	ToolKind,
 } from "@agentclientprotocol/sdk";
 import { logger } from "@oh-my-pi/pi-utils";
-import { parseEditTargetPath } from "../../edit";
+import { type EditToolDetails, type EditToolPerFileResult, parseEditTargetPath } from "../../edit";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { DEFAULT_MAX_BYTES } from "../../session/streaming-output";
-import { formatOutputNotice, type OutputMeta } from "../../tools/output-meta";
+import { formatOutputNotice, type LimitsMeta, type OutputMeta, type TruncationMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
 import { toolResultFailed } from "../../tools/tool-result";
@@ -1551,21 +1551,31 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
 	return locations;
 }
 
-interface AcpEditEntry {
-	path: string;
-	oldText?: string;
-	newText?: string;
+/**
+ * The subset of `edit/renderer.ts`'s result types the ACP mapper reads, kept
+ * as `Pick`s rather than a hand-copied shape: the runtime validators below
+ * describe the producer by hand, so a field renamed or retyped in
+ * `EditToolPerFileResult`/`EditToolDetails` would otherwise make every real
+ * edit result fail `asEditDetails` and silently fall back to plain content —
+ * the same silent-omission class this subsystem exists to close, moved into
+ * the validator. Derived here, `tsgo` fails instead.
+ *
+ * `isError`/`errorText`/`displayErrorText` are per-file only on the producer
+ * (`EditToolDetails` has no such fields), so the aggregate declares them
+ * itself for the extension/MCP results that reach this narrowing.
+ */
+type AcpEditEntry = Pick<
+	EditToolPerFileResult,
+	"path" | "oldText" | "newText" | "isError" | "errorText" | "displayErrorText" | "snapshotsPruned" | "meta"
+>;
+
+interface AcpEditDetails
+	extends Partial<Pick<EditToolDetails, "path" | "oldText" | "newText" | "snapshotsPruned" | "meta">> {
 	isError?: boolean;
 	errorText?: string;
 	displayErrorText?: string;
-	snapshotsPruned?: boolean;
-	meta?: OutputMeta;
-}
-
-interface AcpEditDetails extends Omit<AcpEditEntry, "path"> {
-	path?: string;
 	perFileResults?: AcpEditEntry[];
-	unattemptedPaths?: string[];
+	unattemptedPaths?: EditToolDetails["unattemptedPaths"];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1580,9 +1590,15 @@ function isLineRange(value: unknown): boolean {
 	return isRecord(value) && isFiniteNumber(value.start) && isFiniteNumber(value.end);
 }
 
+/**
+ * Key lists are `satisfies`-checked against the producer's own types for the
+ * same reason `AcpEditEntry` is a `Pick`: a renamed `TruncationMeta`/
+ * `LimitsMeta` field would otherwise make this validator reject every real
+ * `details.meta`, silently dropping the notice it gates.
+ */
 function isOutputMeta(value: unknown): value is OutputMeta {
 	if (!isRecord(value)) return false;
-	const { truncation, source, diagnostics, limits } = value;
+	const { truncation, source, diagnostics, limits }: Partial<Record<keyof OutputMeta, unknown>> = value;
 	if (truncation !== undefined) {
 		if (!isRecord(truncation)) return false;
 		if (truncation.direction !== "head" && truncation.direction !== "tail" && truncation.direction !== "middle") {
@@ -1595,13 +1611,23 @@ function isOutputMeta(value: unknown): value is OutputMeta {
 		) {
 			return false;
 		}
-		for (const key of ["totalLines", "totalBytes", "outputLines", "outputBytes"] as const) {
+		for (const key of [
+			"totalLines",
+			"totalBytes",
+			"outputLines",
+			"outputBytes",
+		] as const satisfies readonly (keyof TruncationMeta)[]) {
 			if (!isFiniteNumber(truncation[key])) return false;
 		}
-		for (const key of ["maxBytes", "elidedBytes", "elidedLines", "nextOffset"] as const) {
+		for (const key of [
+			"maxBytes",
+			"elidedBytes",
+			"elidedLines",
+			"nextOffset",
+		] as const satisfies readonly (keyof TruncationMeta)[]) {
 			if (truncation[key] !== undefined && !isFiniteNumber(truncation[key])) return false;
 		}
-		for (const key of ["shownRange", "headRange", "tailRange"] as const) {
+		for (const key of ["shownRange", "headRange", "tailRange"] as const satisfies readonly (keyof TruncationMeta)[]) {
 			if (truncation[key] !== undefined && !isLineRange(truncation[key])) return false;
 		}
 		if (truncation.artifactId !== undefined && typeof truncation.artifactId !== "string") return false;
@@ -1618,7 +1644,7 @@ function isOutputMeta(value: unknown): value is OutputMeta {
 	}
 	if (limits !== undefined) {
 		if (!isRecord(limits)) return false;
-		for (const key of ["matchLimit", "resultLimit", "headLimit"] as const) {
+		for (const key of ["matchLimit", "resultLimit", "headLimit"] as const satisfies readonly (keyof LimitsMeta)[]) {
 			const limit = limits[key];
 			if (
 				limit !== undefined &&
@@ -1634,10 +1660,16 @@ function isOutputMeta(value: unknown): value is OutputMeta {
 }
 
 function hasValidEditFields(value: Record<string, unknown>): boolean {
-	for (const key of ["path", "oldText", "newText", "errorText", "displayErrorText"] as const) {
+	for (const key of [
+		"path",
+		"oldText",
+		"newText",
+		"errorText",
+		"displayErrorText",
+	] as const satisfies readonly (keyof AcpEditEntry)[]) {
 		if (value[key] !== undefined && typeof value[key] !== "string") return false;
 	}
-	for (const key of ["isError", "snapshotsPruned"] as const) {
+	for (const key of ["isError", "snapshotsPruned"] as const satisfies readonly (keyof AcpEditEntry)[]) {
 		if (value[key] !== undefined && typeof value[key] !== "boolean") return false;
 	}
 	return value.meta === undefined || isOutputMeta(value.meta);
@@ -2162,8 +2194,9 @@ function extractDetailsNotices(value: unknown): string | undefined {
 /**
  * `extractDetailsNotices` plus the same `details.meta` truncation/limit/
  * diagnostics notice `extractOutputNoticeText` re-derives for edit results —
- * generalized here to any tool, since `asEditDetails`' only real validation
- * is `perFileResults`' shape, which a non-edit result simply lacks.
+ * generalized here to any tool: `asEditDetails` validates the edit-shaped
+ * fields and `details.meta` only when present, so a non-edit result carrying
+ * just a `meta` still narrows and a malformed one falls back to plain text.
  *
  * Needed because the truncation/artifact-recovery notice
  * (`wrapToolWithMetaNotice` → `formatOutputNotice`) is appended to the
