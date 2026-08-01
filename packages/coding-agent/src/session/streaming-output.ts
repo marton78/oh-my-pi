@@ -48,6 +48,23 @@ export interface OutputSummary {
 	columnMax?: number;
 	/** Artifact ID for internal URL access (artifact://<id>) when truncated */
 	artifactId?: string;
+	/**
+	 * The bracketed `[notice]` line {@link OutputSink.dump} prefixed onto
+	 * {@link output}, verbatim — `undefined` when `dump()` got no notice.
+	 *
+	 * `push()` streams every chunk through `onChunk`, which is how bytes reach
+	 * a live renderer's tail buffer (the TUI card, the ACP meta-terminal
+	 * watermark). `dump(notice)` does not: it composes the notice straight into
+	 * the returned body. So a `dump()` annotation — the reason a command
+	 * stopped: a timeout, a kernel kill, a stdin request — exists only in the
+	 * model-facing text unless the caller mirrors it into a structural field
+	 * its renderers read (`BashToolDetails.notices`, `EvalToolDetails.notices`).
+	 * Every caller that used to re-derive or re-thread that string by hand got
+	 * it wrong at least once (oh-my-pi/oh-my-pi#7078 reviews r3693523855,
+	 * r3694816752), so the summary carries it: it travels with the text it was
+	 * baked into, and a mirror site reads it instead of reconstructing it.
+	 */
+	annotation?: string;
 }
 
 export interface OutputSinkOptions {
@@ -1275,7 +1292,8 @@ export class OutputSink {
 			this.#pendingCarriageReturn = false;
 			this.push(NL);
 		}
-		const noticeLine = notice ? `[${notice}]\n` : "";
+		const annotation = notice ? `[${notice}]` : undefined;
+		const noticeLine = annotation ? `${annotation}\n` : "";
 
 		// Flush any chunk still held back by the throttle so the live preview
 		// ends with the complete stream.
@@ -1343,6 +1361,7 @@ export class OutputSink {
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
 			columnMax: this.#columnTruncatedLines > 0 ? this.#maxColumns : undefined,
 			artifactId: this.#file?.artifactId,
+			annotation,
 		};
 	}
 

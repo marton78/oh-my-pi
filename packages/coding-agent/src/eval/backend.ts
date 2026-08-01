@@ -43,15 +43,13 @@ export interface ExecutorBackendResult {
 	outputBytes: number;
 	displayOutputs: EvalDisplayOutput[];
 	/**
-	 * A synthesized note (kernel timeout/kill, stdin request) already baked
-	 * into `output` as a head-prefixed line but never streamed through the
-	 * per-chunk `onChunk` callback — `OutputSink.dump(notice)` composes it
-	 * directly into the returned body without ever calling `onChunk`, unlike
-	 * `push()`, which every other chunk goes through (`executor-base.ts`'s
-	 * `KernelExecutionResult` doc comment). `eval.ts` mirrors this into
+	 * `OutputSummary.annotation` verbatim: the bracketed synthesized note
+	 * (kernel timeout/kill, stdin request) `OutputSink.dump(notice)` baked into
+	 * `output` without ever streaming it through `onChunk`, unlike `push()`,
+	 * which every other chunk goes through. `eval.ts` mirrors it into
 	 * `EvalToolDetails.notices` so the ACP terminal path — which reads only
-	 * structured facts, never the model-facing text — doesn't silently drop
-	 * the reason a cell stopped (oh-my-pi/oh-my-pi#7078 review r3693523855).
+	 * structured facts, never the model-facing text — doesn't silently drop the
+	 * reason a cell stopped (oh-my-pi/oh-my-pi#7078 review r3693523855).
 	 */
 	annotation?: string;
 }

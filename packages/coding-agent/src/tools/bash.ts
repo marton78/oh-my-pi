@@ -695,14 +695,27 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		if (isTimeout) {
 			details.timedOut = true;
-			const message =
-				timeoutSec === undefined ? "Command timed out" : `Command timed out after ${timeoutSec} seconds`;
-			// executeBash has already emitted this leading sink notice. PTY output
-			// has not, so provide the LLM-facing annotation exactly once.
-			if (!normalizeResultOutput(result).startsWith(`[${message}]\n`)) {
-				outputLines.push("", `[${message}]`);
-				notices.push(`[${message}]`);
+			// `executeBash` bakes this line into `output` itself via
+			// `sink.dump(notice)` (which never streams it through `onChunk`);
+			// the PTY path emits nothing. `result.annotation` distinguishes the
+			// two without re-deriving the wording, so the *text* echo stays
+			// conditional — it must appear exactly once.
+			//
+			// The *structural* mirror is unconditional. `details.notices` is the
+			// only channel a terminal-rendering client has: for a live
+			// client-owned terminal the process bytes went straight to the
+			// terminal and this annotation never did, and for a display-only
+			// meta terminal the mapper classifies an annotation-prefixed final
+			// body as a re-render and sends structured facts alone. Gating this
+			// push on the text branch is what hid the timeout reason from both
+			// (oh-my-pi/oh-my-pi#7078 review r3694816752).
+			const annotation =
+				result.annotation ??
+				`[${timeoutSec === undefined ? "Command timed out" : `Command timed out after ${timeoutSec} seconds`}]`;
+			if (!normalizeResultOutput(result).startsWith(`${annotation}\n`)) {
+				outputLines.push("", annotation);
 			}
+			notices.push(annotation);
 			const timeoutOutputText = await enforceInlineByteCap(outputLines.join("\n"), inlineCap);
 			if (spilledArtifactId) notices.push(formatRawOutputArtifactNotice(spilledArtifactId));
 			if (notices.length > 0) details.notices = notices;

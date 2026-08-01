@@ -619,7 +619,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						activeLiveCell = undefined;
 					}
 					const durationMs = Date.now() - startTime;
-					if (result.annotation) cellNotices.push(`[${result.annotation}]`);
+					// Already bracketed by `OutputSink.dump` and spelled exactly as
+					// the copy baked into `output`, so the mirror can't drift from
+					// the text (see `OutputSummary.annotation`).
+					if (result.annotation) cellNotices.push(result.annotation);
 
 					const cellStatusEvents: EvalStatusEvent[] = [];
 					const cellDisplayOutputs: EvalDisplayOutput[] = [];
