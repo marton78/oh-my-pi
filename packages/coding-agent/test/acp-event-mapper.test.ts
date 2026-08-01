@@ -3866,34 +3866,53 @@ describe("ACP event mapper", () => {
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "ok" } }]);
 	});
 
-	it("falls back to plain content for malformed edit snapshots and output metadata", () => {
-		const malformedDetails = [
-			{ perFileResults: [{ path: "x.ts", oldText: 42, newText: { bad: true } }] },
+	it("falls back to plain content for malformed edit snapshot types", () => {
+		const updates = mapUpdates(
 			{
-				perFileResults: [
-					{
-						path: "x.ts",
-						oldText: "before",
-						newText: "after",
-						meta: { diagnostics: { summary: "broken", messages: null } },
-					},
-				],
-			},
-		];
+				type: "tool_execution_end",
+				toolCallId: "tc-malformed-edit-snapshot",
+				toolName: "custom_mcp_tool",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "ok" }],
+					details: { perFileResults: [{ path: "x.ts", oldText: 42, newText: { bad: true } }] },
+				},
+			} as unknown as AgentSessionEvent,
+			"session-1",
+		);
+		const update = updates[0]!.update as { content?: ToolCallContent[] };
+		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "ok" } }]);
+	});
 
-		for (const [index, details] of malformedDetails.entries()) {
-			const updates = mapUpdates(
-				{
-					type: "tool_execution_end",
-					toolCallId: `tc-malformed-edit-${index}`,
-					toolName: "custom_mcp_tool",
-					isError: false,
-					result: { content: [{ type: "text", text: "ok" }], details },
-				} as unknown as AgentSessionEvent,
-				"session-1",
-			);
-			const update = updates[0]!.update as { content?: ToolCallContent[] };
-			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "ok" } }]);
-		}
+	// A malformed `meta` costs only its notice, not the whole edit result:
+	// `oldText`/`newText`/`path` feed the `diff` frame and must reject the
+	// result when broken, but rejecting the details for a bad `meta` too would
+	// also disarm `isDisplayReRendered`'s re-render classifier, re-arming the
+	// 51 KB duplicate-delivery bug (oh-my-pi/oh-my-pi#7078 review 4824091334).
+	it("keeps a valid diff and drops only the notice for a malformed output meta", () => {
+		const updates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-malformed-edit-meta",
+				toolName: "custom_mcp_tool",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "ok" }],
+					details: {
+						perFileResults: [
+							{
+								path: "x.ts",
+								oldText: "before",
+								newText: "after",
+								meta: { diagnostics: { summary: "broken", messages: null } },
+							},
+						],
+					},
+				},
+			} as unknown as AgentSessionEvent,
+			"session-1",
+		);
+		const update = updates[0]!.update as { content?: ToolCallContent[] };
+		expect(update.content).toEqual([{ type: "diff", path: "x.ts", oldText: "before", newText: "after" }]);
 	});
 });

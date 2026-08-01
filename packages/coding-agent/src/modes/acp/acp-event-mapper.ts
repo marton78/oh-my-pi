@@ -1266,7 +1266,7 @@ const RECONCILE_LINE_HEAD_CHARS = 40;
  * evidence of a rollover.
  */
 function isDisplayReRendered(result: unknown): boolean {
-	const meta = asEditDetails(result)?.meta;
+	const meta = asOutputMeta(asEditDetails(result)?.meta);
 	if (!meta) return false;
 	return meta.truncation !== undefined || meta.limits?.columnTruncated !== undefined;
 }
@@ -1563,14 +1563,25 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
  * `isError`/`errorText`/`displayErrorText` are per-file only on the producer
  * (`EditToolDetails` has no such fields), so the aggregate declares them
  * itself for the extension/MCP results that reach this narrowing.
+ *
+ * `meta` stays `unknown` here and is narrowed per read by `asOutputMeta`:
+ * unlike `oldText`/`newText`/`path`, which compose a `diff` frame and must
+ * reject the whole result when malformed, a bad `meta` costs only its notice.
+ * Rejecting the details for it would also disarm `isDisplayReRendered` — the
+ * re-render classifier every producer's watermark goes through — and that is
+ * the 51 KB duplicate-delivery bug (oh-my-pi/oh-my-pi#7078 review 4824091334)
+ * re-armed by a validation failure.
  */
-type AcpEditEntry = Pick<
+type AcpEditFields = Pick<
 	EditToolPerFileResult,
 	"path" | "oldText" | "newText" | "isError" | "errorText" | "displayErrorText" | "snapshotsPruned" | "meta"
 >;
 
+type AcpEditEntry = Omit<AcpEditFields, "meta"> & { meta?: unknown };
+
 interface AcpEditDetails
-	extends Partial<Pick<EditToolDetails, "path" | "oldText" | "newText" | "snapshotsPruned" | "meta">> {
+	extends Partial<Omit<Pick<EditToolDetails, "path" | "oldText" | "newText" | "snapshotsPruned" | "meta">, "meta">> {
+	meta?: unknown;
 	isError?: boolean;
 	errorText?: string;
 	displayErrorText?: string;
@@ -1659,6 +1670,11 @@ function isOutputMeta(value: unknown): value is OutputMeta {
 	return true;
 }
 
+/** `meta` never gates `asEditDetails` (see `AcpEditFields`'s comment) — this is its sole read path. */
+function asOutputMeta(value: unknown): OutputMeta | undefined {
+	return isOutputMeta(value) ? value : undefined;
+}
+
 function hasValidEditFields(value: Record<string, unknown>): boolean {
 	for (const key of [
 		"path",
@@ -1672,7 +1688,7 @@ function hasValidEditFields(value: Record<string, unknown>): boolean {
 	for (const key of ["isError", "snapshotsPruned"] as const satisfies readonly (keyof AcpEditEntry)[]) {
 		if (value[key] !== undefined && typeof value[key] !== "boolean") return false;
 	}
-	return value.meta === undefined || isOutputMeta(value.meta);
+	return true;
 }
 
 function isAcpEditEntry(value: unknown): value is AcpEditEntry {
@@ -1809,9 +1825,9 @@ function extractOutputNoticeText(result: unknown): string | undefined {
 		seen.add(attributedNotice);
 		notices.push(attributedNotice);
 	};
-	pushNotice(details.meta, undefined);
+	pushNotice(asOutputMeta(details.meta), undefined);
 	for (const entry of details.perFileResults ?? []) {
-		pushNotice(entry.meta, entry.path.length > 0 ? entry.path : undefined);
+		pushNotice(asOutputMeta(entry.meta), entry.path.length > 0 ? entry.path : undefined);
 	}
 	return notices.length > 0 ? notices.join("\n\n") : undefined;
 }
