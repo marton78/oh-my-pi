@@ -918,7 +918,8 @@ type OutcomeName =
 	| "image"
 	| "stdin request"
 	| "details-only notice"
-	| "partial failure";
+	| "partial failure"
+	| "duplicate per-file notice";
 
 type CoverageCell = string | { none: string };
 
@@ -938,6 +939,9 @@ const COVERAGE: Record<string, Record<OutcomeName, CoverageCell>> = {
 			none: "bash always mirrors its notices into `details.notices`; the details-only axis belongs to eval's `details.notice`",
 		},
 		"partial failure": { none: "a single command either ran or did not; no per-item breakdown exists" },
+		"duplicate per-file notice": {
+			none: "bash has one details.notices list, not per-path text; there is no second file to collide with",
+		},
 	},
 	"bash (client terminal)": {
 		success: {
@@ -952,6 +956,7 @@ const COVERAGE: Record<string, Record<OutcomeName, CoverageCell>> = {
 		"stdin request": { none: "bash never asks for stdin" },
 		"details-only notice": { none: "as in the local-executor row above" },
 		"partial failure": { none: "as in the local-executor row above" },
+		"duplicate per-file notice": { none: "as in the local-executor row above" },
 	},
 	eval: {
 		success: "eval, exit 0",
@@ -968,6 +973,9 @@ const COVERAGE: Record<string, Record<OutcomeName, CoverageCell>> = {
 		"partial failure": {
 			none: "`EvalTool.execute()`'s public entrypoint always builds a single cell (`evalCellCommonFields`), so no cell can fail beside a sibling that succeeded",
 		},
+		"duplicate per-file notice": {
+			none: "eval has no per-file breakdown at all (see the partial-failure cell above), so no two-file notice collision axis exists",
+		},
 	},
 	hub: {
 		success: "hub describe of an already-failed daemon",
@@ -980,6 +988,7 @@ const COVERAGE: Record<string, Record<OutcomeName, CoverageCell>> = {
 		"stdin request": { none: "no interactive input path" },
 		"details-only notice": { none: "hub records its facts in `details.daemon`, covered by the two rows above" },
 		"partial failure": { none: "one op addresses one daemon" },
+		"duplicate per-file notice": { none: "hub addresses one daemon per op; no per-file text axis exists" },
 	},
 	edit: {
 		success: {
@@ -994,6 +1003,9 @@ const COVERAGE: Record<string, Record<OutcomeName, CoverageCell>> = {
 		"stdin request": { none: "no interactive input path" },
 		"details-only notice": { none: "edit's notices ride in `details.meta`, exercised by the partial-failure row" },
 		"partial failure": "edit, multi-file patch with one missing file",
+		"duplicate per-file notice": {
+			none: "edit's only per-file `meta` axis is LSP diagnostics, and `formatDiagnostic` (`lsp/utils.ts`) always bakes the file's own relative path into every message, so two distinct real files can never render a byte-identical notice string before the mapper's own path prefix is added — the bug this axis names cannot occur through any live edit producer. The class it guards against — a producer's per-file `meta` carrying no per-file-identifying text — is exercised directly by `acp-event-mapper.test.ts`'s `preserves file attribution when diagnostics text is identical` regression test, with a hand-built shared `meta` object standing in for that producer shape.",
+		},
 	},
 };
 
@@ -1372,7 +1384,9 @@ describe("ACP mapper survives mutated real edit details", () => {
 							n => (n.update as MinimalToolCallUpdate).sessionUpdate === "tool_call_update",
 						);
 						if (updateNotifications.length !== 1) {
-							failures.push(`${label} [${modeName}]: expected exactly 1 tool_call_update, got ${updateNotifications.length}`);
+							failures.push(
+								`${label} [${modeName}]: expected exactly 1 tool_call_update, got ${updateNotifications.length}`,
+							);
 							continue;
 						}
 						const violations = checkAcpUpdateInvariants(updateNotifications[0]!, {
@@ -1380,7 +1394,8 @@ describe("ACP mapper survives mutated real edit details", () => {
 						});
 						if (violations.length > 0) failures.push(`${label} [${modeName}]: ${violations.join("; ")}`);
 						const update = updateNotifications[0]!.update as MinimalToolCallUpdate;
-						const nonEmpty = (update.content !== undefined && update.content.length > 0) || update._meta !== undefined;
+						const nonEmpty =
+							(update.content !== undefined && update.content.length > 0) || update._meta !== undefined;
 						if (!nonEmpty) failures.push(`${label} [${modeName}]: emitted an empty frame`);
 					} catch (error) {
 						failures.push(`${label} [${modeName}]: ${error instanceof Error ? error.message : String(error)}`);
