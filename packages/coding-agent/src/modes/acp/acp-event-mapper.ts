@@ -11,7 +11,7 @@ import { type EditToolDetails, type EditToolPerFileResult, parseEditTargetPath }
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { DEFAULT_MAX_BYTES } from "../../session/streaming-output";
-import { formatOutputNotice, type LimitsMeta, type OutputMeta, type TruncationMeta } from "../../tools/output-meta";
+import { formatOutputNotice, isRecord, type OutputMeta, sanitizeOutputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
 import { toolResultFailed } from "../../tools/tool-result";
@@ -1276,7 +1276,7 @@ const RECONCILE_LINE_HEAD_CHARS = 40;
  * evidence of a rollover.
  */
 function isDisplayReRendered(result: unknown): boolean {
-	const meta = asOutputMeta(asEditDetails(result)?.meta);
+	const meta = sanitizeOutputMeta(asEditDetails(result)?.meta);
 	if (!meta) return false;
 	return meta.truncation !== undefined || meta.limits?.columnTruncated !== undefined;
 }
@@ -1574,7 +1574,7 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
  * (`EditToolDetails` has no such fields), so the aggregate declares them
  * itself for the extension/MCP results that reach this narrowing.
  *
- * `meta` stays `unknown` here and is narrowed per read by `asOutputMeta`:
+ * `meta` stays `unknown` here and is narrowed per read by `sanitizeOutputMeta`:
  * unlike `oldText`/`newText`/`path`, which compose a `diff` frame and must
  * reject the whole result when malformed, a bad `meta` costs only its notice.
  * Rejecting the details for it would also disarm `isDisplayReRendered` — the
@@ -1597,92 +1597,6 @@ interface AcpEditDetails
 	displayErrorText?: string;
 	perFileResults?: AcpEditEntry[];
 	unattemptedPaths?: EditToolDetails["unattemptedPaths"];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-function isFiniteNumber(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value);
-}
-
-function isLineRange(value: unknown): boolean {
-	return isRecord(value) && isFiniteNumber(value.start) && isFiniteNumber(value.end);
-}
-
-/**
- * Key lists are `satisfies`-checked against the producer's own types for the
- * same reason `AcpEditEntry` is a `Pick`: a renamed `TruncationMeta`/
- * `LimitsMeta` field would otherwise make this validator reject every real
- * `details.meta`, silently dropping the notice it gates.
- */
-function isOutputMeta(value: unknown): value is OutputMeta {
-	if (!isRecord(value)) return false;
-	const { truncation, source, diagnostics, limits }: Partial<Record<keyof OutputMeta, unknown>> = value;
-	if (truncation !== undefined) {
-		if (!isRecord(truncation)) return false;
-		if (truncation.direction !== "head" && truncation.direction !== "tail" && truncation.direction !== "middle") {
-			return false;
-		}
-		if (
-			truncation.truncatedBy !== "lines" &&
-			truncation.truncatedBy !== "bytes" &&
-			truncation.truncatedBy !== "middle"
-		) {
-			return false;
-		}
-		for (const key of [
-			"totalLines",
-			"totalBytes",
-			"outputLines",
-			"outputBytes",
-		] as const satisfies readonly (keyof TruncationMeta)[]) {
-			if (!isFiniteNumber(truncation[key])) return false;
-		}
-		for (const key of [
-			"maxBytes",
-			"elidedBytes",
-			"elidedLines",
-			"nextOffset",
-		] as const satisfies readonly (keyof TruncationMeta)[]) {
-			if (truncation[key] !== undefined && !isFiniteNumber(truncation[key])) return false;
-		}
-		for (const key of ["shownRange", "headRange", "tailRange"] as const satisfies readonly (keyof TruncationMeta)[]) {
-			if (truncation[key] !== undefined && !isLineRange(truncation[key])) return false;
-		}
-		if (truncation.artifactId !== undefined && typeof truncation.artifactId !== "string") return false;
-	}
-	if (source !== undefined) {
-		if (!isRecord(source) || typeof source.value !== "string") return false;
-		if (source.type !== "path" && source.type !== "url" && source.type !== "internal") return false;
-	}
-	if (diagnostics !== undefined) {
-		if (!isRecord(diagnostics) || typeof diagnostics.summary !== "string") return false;
-		if (!Array.isArray(diagnostics.messages) || !diagnostics.messages.every(message => typeof message === "string")) {
-			return false;
-		}
-	}
-	if (limits !== undefined) {
-		if (!isRecord(limits)) return false;
-		for (const key of ["matchLimit", "resultLimit", "headLimit"] as const satisfies readonly (keyof LimitsMeta)[]) {
-			const limit = limits[key];
-			if (
-				limit !== undefined &&
-				(!isRecord(limit) || !isFiniteNumber(limit.reached) || !isFiniteNumber(limit.suggestion))
-			) {
-				return false;
-			}
-		}
-		const column = limits.columnTruncated;
-		if (column !== undefined && (!isRecord(column) || !isFiniteNumber(column.maxColumn))) return false;
-	}
-	return true;
-}
-
-/** `meta` never gates `asEditDetails` (see `AcpEditFields`'s comment) — this is its sole read path. */
-function asOutputMeta(value: unknown): OutputMeta | undefined {
-	return isOutputMeta(value) ? value : undefined;
 }
 
 function hasValidEditFields(value: Record<string, unknown>): boolean {
@@ -1835,9 +1749,9 @@ function extractOutputNoticeText(result: unknown): string | undefined {
 		seen.add(attributedNotice);
 		notices.push(attributedNotice);
 	};
-	pushNotice(asOutputMeta(details.meta), undefined);
+	pushNotice(sanitizeOutputMeta(details.meta), undefined);
 	for (const entry of details.perFileResults ?? []) {
-		pushNotice(asOutputMeta(entry.meta), entry.path.length > 0 ? entry.path : undefined);
+		pushNotice(sanitizeOutputMeta(entry.meta), entry.path.length > 0 ? entry.path : undefined);
 	}
 	return notices.length > 0 ? notices.join("\n\n") : undefined;
 }

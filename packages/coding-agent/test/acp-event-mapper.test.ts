@@ -2940,6 +2940,101 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("does not let a malformed diagnostics sibling re-arm the rollover/discontinuity bug on a valid truncation marker", () => {
+		// Regression test: `isDisplayReRendered` used to read `meta` through the
+		// all-or-nothing `asOutputMeta` — one malformed sibling field
+		// (`diagnostics.messages: null` here) rejected the *entire* `meta`
+		// object, discarding an otherwise-valid `truncation` marker along with
+		// it. That marker only matters on the *grow* path past bash's 50 KB
+		// rollover floor (`DEFAULT_MAX_BYTES`, `buildFinalMetaTerminalDelta`):
+		// a middle-elided head+tail summary can be genuinely longer than the
+		// live watermark it replaces (the watermark holds only the bounded
+		// tail buffer's window; the elided summary retains head *and* tail),
+		// and shares no byte-for-byte suffix with it. Losing the marker there
+		// reclassified that re-render as a plausible rollover continuation,
+		// which resynced via `deliveredOverlap` (zero, correctly, since it's
+		// not a continuation) and fired a false
+		// "[terminal output discontinuity]" notice plus a full re-send of the
+		// already-shown body — the exact review-4824091334 bug this marker
+		// exists to prevent, re-armed by an unrelated sibling's malformed
+		// shape.
+		const sent = new Map<string, string>();
+		const options = {
+			terminalMetaCapable: true,
+			getMetaTerminalSent: (id: string) => sent.get(id),
+			setMetaTerminalSent: (id: string, text: string) => {
+				sent.set(id, text);
+			},
+		};
+		// The live watermark: exactly bash's 50 KB rollover floor
+		// (`DEFAULT_MAX_BYTES`), one repeated character so its own content
+		// shares nothing with the elided summary below.
+		mapUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-malformed-diagnostics-sibling",
+				toolName: "bash",
+				args: { command: "yes | head -c 51200" },
+				partialResult: { content: [{ type: "text", text: "y".repeat(51200) }], details: {} },
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const truncation = {
+			direction: "middle" as const,
+			truncatedBy: "middle" as const,
+			totalLines: 1,
+			totalBytes: 60000,
+			outputLines: 2,
+			outputBytes: 60000,
+			headRange: { start: 1, end: 1 },
+			tailRange: { start: 1, end: 1 },
+			elidedBytes: 0,
+			elidedLines: 0,
+			artifactId: "7",
+		};
+		// The final result: a middle-elided head+tail summary of *different*
+		// content ("a"/"b", disjoint from the watermark's "y") that totals
+		// more bytes (60013) than the watermark (51200) — the grow case, past
+		// the rollover floor, with zero real overlap. Only `isDisplayReRendered`
+		// (via `meta.truncation`) can correctly classify this as a re-render
+		// instead of a rollover.
+		const endUpdates = mapUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-malformed-diagnostics-sibling",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: `${"a".repeat(30000)}\n… [elided] …\n${"b".repeat(30000)}` }],
+					details: {
+						notices: ["(output truncated)"],
+						// The only difference from a well-formed result: a malformed
+						// sibling next to the otherwise-valid `truncation`.
+						// `messages: null` fails `isValidDiagnosticMeta` (it requires an
+						// array), so this field alone must be dropped — not the whole
+						// `meta`, and not the `truncation` beside it.
+						meta: { truncation, diagnostics: { summary: "broken", messages: null } },
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			options,
+		);
+		const end = endUpdates[0]!.update as { _meta?: { terminal_output?: { data: string } } };
+		const data = end._meta?.terminal_output?.data ?? "";
+		// No false discontinuity notice.
+		expect(data).not.toContain("terminal output discontinuity");
+		// No duplicate re-send of the 60 KB re-rendered body: `undeliveredBodyLines`'s
+		// own cap (`MAX_RECONCILED_BODY_BYTES`, 2000) refuses to reconcile a
+		// divergence this large, so the delivered bytes stay at notice size —
+		// nowhere near the ~60 KB a re-sent body would add.
+		expect(data.length).toBeLessThan(500);
+		expect(data).toBe(
+			"\n(output truncated)\n\n[Showing lines 1-1 and 1-1 of 1; 0 middle lines (0B) elided. Read artifact://7 for full output]\n",
+		);
+	});
+
 	it("delivers a re-rendered final body's line that the producer declared nowhere structurally", () => {
 		// The class every round of this review kept re-finding one instance of:
 		// a producer bakes a fact into its own text (here an `OutputSink.dump`

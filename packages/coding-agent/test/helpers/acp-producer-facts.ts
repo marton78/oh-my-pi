@@ -1,5 +1,5 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { formatOutputNotice, type OutputMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { formatOutputNotice, sanitizeOutputMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 
 function stringField(value: object, key: string): string | undefined {
 	if (!(key in value)) return undefined;
@@ -42,8 +42,12 @@ export function producerFacts(result: AgentToolResult<unknown> | Record<string, 
 			if (single) noticeLines.push(single);
 			facts.push(...noticeLines);
 			if ("meta" in details) {
-				const meta = (details as { meta?: OutputMeta }).meta;
-				const metaNotice = meta ? formatOutputNotice(meta) : "";
+				// Mirrors the mapper's own `sanitizeOutputMeta` read path: a
+				// producer's `meta` isn't guaranteed well-formed (an extension/MCP
+				// tool, a corrupted replay record), and formatting it unsanitized
+				// would either throw on a malformed sibling or restate a fact the
+				// mapper itself would have dropped.
+				const metaNotice = formatOutputNotice(sanitizeOutputMeta((details as { meta?: unknown }).meta));
 				if (metaNotice) {
 					// A spilled result can carry the same recovery pointer from two
 					// independent subsystems — bash's own `[raw output: artifact://N]`
